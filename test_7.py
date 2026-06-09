@@ -175,10 +175,26 @@ def parse_distributed_qty_table(driver) -> dict:
 # DRIVER
 # =========================================
 
-driver = webdriver.Chrome()
-driver.maximize_window()
-wait = WebDriverWait(driver, 20)
+# driver = webdriver.Chrome()
+# driver.maximize_window()
+# wait = WebDriverWait(driver, 20)
 
+# =========================================
+# DRIVER — Modified for GitHub Actions Server
+# =========================================
+
+from selenium.webdriver.chrome.options import Options
+
+options = Options()
+options.add_argument("--headless=new")           # Runs Chrome silently without a GUI
+options.add_argument("--no-sandbox")             # Required for running inside Docker/Linux servers
+options.add_argument("--disable-dev-shm-usage")   # Overcomes limited resource problems in server environments
+options.add_argument("--disable-gpu")             # Disables hardware acceleration
+options.add_argument("--window-size=1920,1080")   # Sets a standard virtual window size
+
+# Note: We do not pass an executable path. GitHub Actions has Chromedriver pre-configured in its system PATH.
+driver = webdriver.Chrome(options=options)
+wait = WebDriverWait(driver, 20)
 
 def change_month(year, month_num):
     calendar_btn = wait.until(
