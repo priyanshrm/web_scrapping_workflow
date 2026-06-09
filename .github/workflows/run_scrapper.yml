@@ -1,0 +1,36 @@
+name: Run IMPDS Scraper
+
+on:
+  schedule:
+    # This automatically runs the script at 00:00 UTC on the 1st of every month
+    # You can change this cron expression if you want it to run daily or weekly.
+    - cron: '0 0 1 * *' 
+  workflow_dispatch: # This allows you to manually press a "Run" button inside GitHub anytime
+
+jobs:
+  scrape-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code from repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install selenium
+
+      - name: Run Scraper Script
+        run: python test_7.py
+
+      - name: Commit and Push CSV changes back to GitHub
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add *.csv
+          git commit -m "Auto-updated scraped district data [Skip CI]" || exit 0
+          git push
