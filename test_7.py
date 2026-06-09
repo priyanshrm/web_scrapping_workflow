@@ -137,16 +137,18 @@ def open_home():
 
 def change_month(year, month):
     wait.until(EC.element_to_be_clickable((By.ID, "calModal"))).click()
-
     wait.until(EC.presence_of_element_located((By.ID, "selectedyear")))
+    
     driver.execute_script("""
         let y = document.getElementById('selectedyear');
         y.value = arguments[0];
         y.dispatchEvent(new Event('change'));
     """, str(year))
 
+    time.sleep(1)
+
     months = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".cal_month a")))
-    months[month - 1].click()
+    driver.execute_script("arguments[0].click();", months[month - 1])  # JS click bypasses interactability
 
     time.sleep(2)
 
