@@ -80,6 +80,10 @@ def ensure_columns(cols):
 
     print(f"[CSV] Added columns: {new_cols}")
 
+def fill_missing_sub_columns(row):
+    for col in get_fields():
+        if col.startswith('-') and col not in row:
+            row[col] = "0.0"
 
 def upsert_row(new_row):
     ensure_columns(new_row.keys())
@@ -162,184 +166,6 @@ def open_states_modal():
 # ==============================
 # TABLE PARSER
 # ==============================
-# def parse_table():
-#     data = {}
-
-#     # Expand all collapsed panels before reading
-#     driver.execute_script("""
-#         document.querySelectorAll('.menu-toggle[aria-expanded="false"]').forEach(btn => btn.click());
-#     """)
-#     time.sleep(0.5)
-
-#     tables = driver.find_elements(By.TAG_NAME, "table")
-
-#     for table in tables:
-#         try:
-#             headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-#             if "Commodity" not in headers:
-#                 continue
-
-#             val_col_idx = None
-#             for i, h in enumerate(headers):
-#                 if h.lower() in ("quantity", "offtake", "value", "amount", "qty"):
-#                     val_col_idx = i
-#                     break
-#             if val_col_idx is None:
-#                 val_col_idx = 4
-
-#             rows = table.find_elements(By.TAG_NAME, "tr")
-#             in_sub_section = False
-
-#             for row in rows:
-#                 cells = row.find_elements(By.TAG_NAME, "td")
-#                 if len(cells) < val_col_idx + 1:
-#                     continue
-
-#                 cell_html = cells[0].get_attribute("innerHTML") or ""
-#                 name_raw = cells[0].text.strip()
-
-#                 # Fallback: strip tags from HTML if text is empty
-#                 if not name_raw:
-#                     name_raw = re.sub(r'<[^>]+>', '', cell_html).strip()
-
-#                 val = cells[val_col_idx].text.strip()
-
-#                 if not name_raw and "menu-toggle" not in cell_html:
-#                     continue
-
-#                 if "menu-toggle" in cell_html:
-#                     aria = re.search(r'aria-controls="([^"]+)"', cell_html)
-#                     btn_text = re.search(r'</i>\s*([^<]+)', cell_html)
-#                     if btn_text:
-#                         name_raw = btn_text.group(1).strip()
-#                     elif aria:
-#                         name_raw = aria.group(1).replace("Panel", "").replace("_", " ").title()
-#                     col = commodity_to_col(name_raw, False)
-#                     data[col] = val
-#                     in_sub_section = True
-#                     continue
-
-#                 if name_raw.lower() == "total":
-#                     in_sub_section = False
-#                     continue
-
-#                 col = commodity_to_col(name_raw, in_sub_section)
-#                 data[col] = val
-
-#             return data
-
-#         except Exception as e:
-#             print(f"Table parse error: {e}")
-#             continue
-
-#     return data
-
-# def parse_table():
-#     data = {}
-
-#     # Expand all collapsed panels and force visibility
-#     driver.execute_script("""
-#         document.querySelectorAll('.menu-toggle').forEach(btn => {
-#             btn.setAttribute('aria-expanded', 'true');
-#         });
-#         document.querySelectorAll('[id$="Panel"]').forEach(panel => {
-#             panel.style.display = '';
-#             panel.style.visibility = 'visible';
-#             panel.removeAttribute('hidden');
-#             panel.classList.remove('collapse', 'collapsed');
-#             panel.classList.add('show');
-#         });
-#     """)
-#     time.sleep(1)
-
-#     tables = driver.find_elements(By.TAG_NAME, "table")
-
-#     for table in tables:
-#         try:
-#             headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-#             if "Commodity" not in headers:
-#                 continue
-
-#             val_col_idx = None
-#             for i, h in enumerate(headers):
-#                 if h.lower() in ("quantity", "offtake", "value", "amount", "qty"):
-#                     val_col_idx = i
-#                     break
-#             if val_col_idx is None:
-#                 val_col_idx = 4
-
-#             rows = table.find_elements(By.TAG_NAME, "tr")
-#             in_sub_section = False
-
-#             for row in rows:
-#                 cells = row.find_elements(By.TAG_NAME, "td")
-#                 if len(cells) < val_col_idx + 1:
-#                     continue
-
-#                 cell_html = cells[0].get_attribute("innerHTML") or ""
-#                 name_raw = cells[0].text.strip()
-
-#                 if not name_raw:
-#                     name_raw = re.sub(r'<[^>]+>', '', cell_html).strip()
-
-#                 val = cells[val_col_idx].text.strip()
-
-#                 if not name_raw and "menu-toggle" not in cell_html:
-#                     continue
-
-#                 if "menu-toggle" in cell_html:
-#                     btn_text = re.search(r'</i>\s*([^<]+)', cell_html)
-#                     aria = re.search(r'aria-controls="([^"]+)"', cell_html)
-#                     if btn_text:
-#                         name_raw = btn_text.group(1).strip()
-#                     elif aria:
-#                         name_raw = aria.group(1).replace("Panel", "").replace("_", " ").title()
-#                     col = commodity_to_col(name_raw, False)
-#                     data[col] = val
-#                     in_sub_section = True
-#                     continue
-
-#                 if name_raw.lower() == "total":
-#                     in_sub_section = False
-#                     continue
-
-#                 col = commodity_to_col(name_raw, in_sub_section)
-#                 data[col] = val
-
-#             return data
-
-#         except Exception as e:
-#             print(f"Table parse error: {e}")
-#             continue
-
-#     return data
-
-# def parse_table():
-#     data = {}
-
-#     driver.execute_script("""
-#         document.querySelectorAll('.menu-toggle').forEach(btn => {
-#             btn.setAttribute('aria-expanded', 'true');
-#         });
-#         document.querySelectorAll('[id$="Panel"]').forEach(panel => {
-#             panel.style.display = '';
-#             panel.style.visibility = 'visible';
-#             panel.removeAttribute('hidden');
-#             panel.classList.remove('collapse', 'collapsed');
-#             panel.classList.add('show');
-#         });
-#     """)
-#     time.sleep(1)
-
-#     # DEBUG - print full table HTML once
-#     tables = driver.find_elements(By.TAG_NAME, "table")
-#     for table in tables:
-#         headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-#         if "Commodity" in headers:
-#             print("TABLE HTML:\n", table.get_attribute("outerHTML")[:3000])
-#             break
-
-#     return data
 
 def parse_table():
     data = {}
@@ -534,6 +360,8 @@ try:
                     "date": f"{TARGET_YEAR}-{TARGET_MONTH:02d}",
                     **commodities
                 }
+
+                fill_missing_sub_columns(row)    # ← add this line
 
                 upsert_row(row)
 
