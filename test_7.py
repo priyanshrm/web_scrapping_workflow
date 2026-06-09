@@ -314,9 +314,37 @@ def open_states_modal():
 
 #     return data
 
+# def parse_table():
+#     data = {}
+
+#     driver.execute_script("""
+#         document.querySelectorAll('.menu-toggle').forEach(btn => {
+#             btn.setAttribute('aria-expanded', 'true');
+#         });
+#         document.querySelectorAll('[id$="Panel"]').forEach(panel => {
+#             panel.style.display = '';
+#             panel.style.visibility = 'visible';
+#             panel.removeAttribute('hidden');
+#             panel.classList.remove('collapse', 'collapsed');
+#             panel.classList.add('show');
+#         });
+#     """)
+#     time.sleep(1)
+
+#     # DEBUG - print full table HTML once
+#     tables = driver.find_elements(By.TAG_NAME, "table")
+#     for table in tables:
+#         headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
+#         if "Commodity" in headers:
+#             print("TABLE HTML:\n", table.get_attribute("outerHTML")[:3000])
+#             break
+
+#     return data
+
 def parse_table():
     data = {}
 
+    # Force expand all panels
     driver.execute_script("""
         document.querySelectorAll('.menu-toggle').forEach(btn => {
             btn.setAttribute('aria-expanded', 'true');
@@ -329,15 +357,92 @@ def parse_table():
             panel.classList.add('show');
         });
     """)
-    time.sleep(1)
+    time.sleep(0.5)
 
-    # DEBUG - print full table HTML once
     tables = driver.find_elements(By.TAG_NAME, "table")
+
     for table in tables:
-        headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-        if "Commodity" in headers:
-            print("TABLE HTML:\n", table.get_attribute("outerHTML")[:3000])
-            break
+        try:
+            headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
+            if "Commodity" not in headers:
+                continue
+
+            val_col_idx = None
+            for i, h in enumerate(headers):
+                if h.lower() in ("quantity", "offtake", "value", "amount", "qty", "total"):
+                    val_col_idx = i
+                    break
+            if val_col_idx is None:
+                val_col_idx = 4
+
+            rows = table.find_elements(By.TAG_NAME, "tr")
+            in_sub_section = False
+            parent_col = None
+
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) < val_col_idx + 1:
+                    continue
+
+                cell_html = cells[0].get_attribute("innerHTML") or ""
+                name_raw = cells[0].text.strip()
+
+                if not name_raw:
+                    name_raw = re.sub(r'<[^>]+>', '', cell_html).strip()
+
+                val = cells[val_col_idx].text.strip()
+
+                if not name_raw and "menu-toggle" not in cell_html:
+                    continue
+
+                if "menu-toggle" in cell_html:
+                    btn_text = re.search(r'</i>\s*([^<]+)', cell_html)
+                    aria = re.search(r'aria-controls="([^"]+)"', cell_html)
+                    if btn_text:
+                        name_raw = btn_text.group(1).strip()
+                    elif aria:
+                        name_raw = aria.group(1).replace("Panel", "").replace("_", " ").title()
+
+                    col = commodity_to_col(name_raw, False)
+                    data[col] = val
+                    parent_col = col
+                    in_sub_section = True
+
+                    # Parse sub-items from the panel div directly
+                    if aria:
+                        panel_id = aria.group(1)
+                        try:
+                            panel = driver.find_element(By.ID, panel_id)
+                            panel_rows = panel.find_elements(By.TAG_NAME, "tr")
+                            for pr in panel_rows:
+                                pcells = pr.find_elements(By.TAG_NAME, "td")
+                                if len(pcells) < val_col_idx + 1:
+                                    continue
+                                pname = pcells[0].text.strip()
+                                if not pname:
+                                    pname = re.sub(r'<[^>]+>', '', pcells[0].get_attribute("innerHTML") or "").strip()
+                                if not pname or pname.lower() == "total":
+                                    continue
+                                pval = pcells[val_col_idx].text.strip()
+                                data[commodity_to_col(pname, True)] = pval
+                        except Exception as e:
+                            print(f"Panel parse error ({panel_id}): {e}")
+
+                    in_sub_section = False
+                    continue
+
+                if name_raw.lower() == "total":
+                    in_sub_section = False
+                    continue
+
+                col = commodity_to_col(name_raw, in_sub_section)
+                data[col] = val
+
+            return data
+
+        except Exception as e:
+            print(f"Table parse error: {e}")
+            continue
 
     return data
 
