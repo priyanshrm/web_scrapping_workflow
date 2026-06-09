@@ -165,13 +165,16 @@ def parse_table():
 
     tables = driver.find_elements(By.TAG_NAME, "table")
 
-    # DEBUG - remove after confirming sub-row class
+    # DEBUG - replace previous debug block
     for table in tables:
+        headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
+        if "Commodity" not in headers:
+            continue
         rows = table.find_elements(By.TAG_NAME, "tr")
-        for row in rows[:20]:
+        for row in rows[:15]:
             cells = row.find_elements(By.TAG_NAME, "td")
             if cells:
-                print(f"CLASS: '{row.get_attribute('class')}' | TEXT: {cells[0].text.strip()[:30]}")
+                print(f"STYLE: '{cells[0].get_attribute('style')}' | HTML: {cells[0].get_attribute('innerHTML')[:120]}")
         break
 
     for table in tables:
