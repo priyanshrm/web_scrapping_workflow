@@ -12,7 +12,7 @@ from selenium.webdriver.chrome.options import Options
 TARGET_YEAR = 2026
 TARGET_MONTH = 4
 START_STATE = 0
-END_STATE = None
+END_STATE = 1
 
 CSV_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_district_data.csv"
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
