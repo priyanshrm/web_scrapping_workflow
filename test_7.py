@@ -167,68 +167,68 @@ def parse_table():
 
     tables = driver.find_elements(By.TAG_NAME, "table")
 
-    # DEBUG - replace previous debug block
-    for table in tables:
-        headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-        if "Commodity" not in headers:
-            continue
-        rows = table.find_elements(By.TAG_NAME, "tr")
-        for row in rows[:15]:
-            cells = row.find_elements(By.TAG_NAME, "td")
-            if cells:
-                print(f"STYLE: '{cells[0].get_attribute('style')}' | HTML: {cells[0].get_attribute('innerHTML')[:120]}")
-        break
-
     for table in tables:
         try:
             headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
             if "Commodity" not in headers:
                 continue
 
-            # Find value column index dynamically
             val_col_idx = None
             for i, h in enumerate(headers):
                 if h.lower() in ("quantity", "offtake", "value", "amount", "qty"):
                     val_col_idx = i
                     break
             if val_col_idx is None:
-                val_col_idx = 4  # fallback
+                val_col_idx = 4
 
             rows = table.find_elements(By.TAG_NAME, "tr")
-            last_parent = None
+            in_sub_section = False
 
             for row in rows:
                 cells = row.find_elements(By.TAG_NAME, "td")
                 if len(cells) < val_col_idx + 1:
                     continue
 
-                name = cells[0].text.strip()
-                if not name or name.lower() == "total":
+                cell_html = cells[0].get_attribute("innerHTML") or ""
+                name_raw = cells[0].text.strip()
+                val = cells[val_col_idx].text.strip()
+
+                if not name_raw and "menu-toggle" not in cell_html:
                     continue
 
-                val = cells[val_col_idx].text.strip()
-                row_class = row.get_attribute("class") or ""
+                # Row with menu-toggle button = collapsible parent (e.g. "Coarse Grains")
+                if "menu-toggle" in cell_html:
+                    # Extract name from button text or aria-controls
+                    import re as _re
+                    aria = _re.search(r'aria-controls="([^"]+)"', cell_html)
+                    btn_text = _re.search(r'</i>\s*([^<]+)', cell_html)
+                    if btn_text:
+                        name_raw = btn_text.group(1).strip()
+                    elif aria:
+                        name_raw = aria.group(1).replace("Panel", "").replace("_", " ").title()
+                    col = commodity_to_col(name_raw, False)
+                    data[col] = val
+                    in_sub_section = True
+                    continue
 
-                # Detect sub-row: indented text OR known sub-row classes
-                first_cell_html = cells[0].get_attribute("innerHTML") or ""
-                is_sub = (
-                    "customRow" in row_class
-                    or "sub" in row_class.lower()
-                    or "child" in row_class.lower()
-                    or "padding-left" in first_cell_html
-                    or "pl-" in row_class  # Bootstrap padding
-                    or (last_parent is not None and cells[0].get_attribute("style") and "padding" in cells[0].get_attribute("style"))
-                )
+                if name_raw.lower() == "total":
+                    in_sub_section = False
+                    continue
 
-                col = commodity_to_col(name, is_sub)
+                # If name looks like a new top-level item after sub-section ended
+                # (no indent, no button) — reset sub-section flag
+                # We detect top-level by checking if it's NOT indented
+                # Since all styles are empty, we rely on position after "total" or start
+                col = commodity_to_col(name_raw, in_sub_section)
                 data[col] = val
 
-                if not is_sub:
-                    last_parent = name
+                # If we see a plain named row after sub-items, it could be new top-level
+                # Reset only when we hit "total" (handled above)
 
             return data
 
-        except:
+        except Exception as e:
+            print(f"Table parse error: {e}")
             continue
 
     return data
