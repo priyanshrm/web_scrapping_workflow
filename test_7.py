@@ -160,11 +160,19 @@ def open_states_modal():
 # ==============================
 # TABLE PARSER
 # ==============================
-
 def parse_table():
     data = {}
 
     tables = driver.find_elements(By.TAG_NAME, "table")
+
+    # DEBUG - remove after confirming sub-row class
+    for table in tables:
+        rows = table.find_elements(By.TAG_NAME, "tr")
+        for row in rows[:20]:
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if cells:
+                print(f"CLASS: '{row.get_attribute('class')}' | TEXT: {cells[0].text.strip()[:30]}")
+        break
 
     for table in tables:
         try:
@@ -172,22 +180,46 @@ def parse_table():
             if "Commodity" not in headers:
                 continue
 
+            # Find value column index dynamically
+            val_col_idx = None
+            for i, h in enumerate(headers):
+                if h.lower() in ("quantity", "offtake", "value", "amount", "qty"):
+                    val_col_idx = i
+                    break
+            if val_col_idx is None:
+                val_col_idx = 4  # fallback
+
             rows = table.find_elements(By.TAG_NAME, "tr")
+            last_parent = None
 
             for row in rows:
                 cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) < 5:
+                if len(cells) < val_col_idx + 1:
                     continue
 
                 name = cells[0].text.strip()
-                if name.lower() == "total":
+                if not name or name.lower() == "total":
                     continue
 
-                val = cells[4].text.strip()
-                is_sub = "customRow" in (row.get_attribute("class") or "")
+                val = cells[val_col_idx].text.strip()
+                row_class = row.get_attribute("class") or ""
+
+                # Detect sub-row: indented text OR known sub-row classes
+                first_cell_html = cells[0].get_attribute("innerHTML") or ""
+                is_sub = (
+                    "customRow" in row_class
+                    or "sub" in row_class.lower()
+                    or "child" in row_class.lower()
+                    or "padding-left" in first_cell_html
+                    or "pl-" in row_class  # Bootstrap padding
+                    or (last_parent is not None and cells[0].get_attribute("style") and "padding" in cells[0].get_attribute("style"))
+                )
 
                 col = commodity_to_col(name, is_sub)
                 data[col] = val
+
+                if not is_sub:
+                    last_parent = name
 
             return data
 
