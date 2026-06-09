@@ -7,241 +7,285 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
+
+
+# ==============================
+# CONFIG
+# ==============================
 
 TARGET_YEAR = 2026
 TARGET_MONTH = 4
 START_STATE = 0
-END_STATE = 1
+END_STATE = 100
 
+BASE_URL = "https://impds.nic.in/sale/"
 CSV_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_district_data.csv"
+
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
+KEY_FIELDS = ["state", "district_code", "date"]
 
-# =========================================
-# CSV HELPERS
-# =========================================
-def commodity_to_col(commodity_name: str, is_sub_row: bool) -> str:
-    col = commodity_name.strip().lower().replace(" ", "_")
-    if is_sub_row:
-        col = f"-{col}"
-    return col
 
-def get_current_fieldnames():
-    if not os.path.exists(CSV_FILE):
-        return list(FIXED_FIELDS)
-    with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        try:
-            return next(reader)
-        except StopIteration:
-            return list(FIXED_FIELDS)
+# ==============================
+# DRIVER
+# ==============================
 
-def ensure_columns(new_cols):
-    current_fields = get_current_fieldnames()
-    added = [c for c in new_cols if c not in current_fields]
-    if not added:
-        return
-
-    updated_fields = current_fields + added
-    existing_rows = []
-
-    if os.path.exists(CSV_FILE):
-        with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            existing_rows = list(reader)
-
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=updated_fields, restval="")
-        writer.writeheader()
-        for row in existing_rows:
-            writer.writerow(row)
-
-    print(f"[CSV] Added columns: {added}")
-
-def append_row(row):
-    ensure_columns(list(row.keys()))
-    fieldnames = get_current_fieldnames()
-
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
-        writer.writerow(row)
-
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIXED_FIELDS)
-        writer.writeheader()
-
-# =========================================
-# FIXED TABLE PARSER
-# =========================================
-def parse_distributed_qty_table(driver):
-    commodity_data = {}
-
-    try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.XPATH, "//table[contains(@aria-label, 'Distributed Quantity')]"))
-        )
-    except:
-        return commodity_data
-
-    tables = driver.find_elements(By.TAG_NAME, "table")
-    target_table = None
-
-    for table in tables:
-        aria = table.get_attribute("aria-label") or ""
-        if "Distributed Quantity" in aria:
-            target_table = table
-            break
-
-    if not target_table:
-        return commodity_data
-
-    rows = target_table.find_elements(By.TAG_NAME, "tr")
-
-    for row in rows:
-        try:
-            cells = row.find_elements(By.TAG_NAME, "td")
-            if len(cells) < 5:
-                continue
-
-            commodity_raw = cells[0].text.strip()
-            if not commodity_raw or commodity_raw.lower() == "total":
-                continue
-
-            total_val = cells[4].text.strip()
-
-            # ✅ ROBUST SUB-ROW DETECTION
-            try:
-                html = cells[0].get_attribute("innerHTML")
-                is_sub = ("&nbsp;" in html) or ("padding-left" in html.lower())
-            except:
-                is_sub = False
-
-            col_name = commodity_to_col(commodity_raw, is_sub)
-            commodity_data[col_name] = total_val
-
-        except:
-            continue
-
-    return commodity_data
-
-# =========================================
-# DRIVER SETUP (CI SAFE)
-# =========================================
-options = Options()
-options.add_argument("--headless=new")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--disable-gpu")
-options.add_argument("--window-size=1920,1080")
+options = webdriver.ChromeOptions()
 options.add_argument("--disable-blink-features=AutomationControlled")
+options.add_argument("--start-maximized")
 
 driver = webdriver.Chrome(options=options)
 wait = WebDriverWait(driver, 20)
 
-def change_month(year, month_num):
-    calendar_btn = wait.until(EC.element_to_be_clickable((By.ID, "calModal")))
-    driver.execute_script("arguments[0].click();", calendar_btn)
 
-    year_dropdown = wait.until(EC.presence_of_element_located((By.ID, "selectedyear")))
-    driver.execute_script("arguments[0].value = arguments[1]", year_dropdown, str(year))
-    driver.execute_script("arguments[0].dispatchEvent(new Event('change'))", year_dropdown)
+# ==============================
+# CSV HELPERS
+# ==============================
 
-    old_page = driver.find_element(By.TAG_NAME, "body").text
-    months = driver.find_elements(By.CSS_SELECTOR, ".cal_month a")
+def commodity_to_col(name, is_sub):
+    col = name.strip().lower().replace(" ", "_")
+    return f"-{col}" if is_sub else col
 
-    driver.execute_script("arguments[0].click();", months[month_num - 1])
 
-    wait.until(lambda d: d.find_element(By.TAG_NAME, "body").text != old_page)
+def get_fields():
+    if not os.path.exists(CSV_FILE):
+        return list(FIXED_FIELDS)
+    with open(CSV_FILE, "r", encoding="utf-8") as f:
+        return next(csv.reader(f))
 
-# =========================================
-# MAIN LOOP
-# =========================================
-try:
-    driver.get("https://impds.nic.in/sale/")
-    change_month(TARGET_YEAR, TARGET_MONTH)
 
-    states_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
-    driver.execute_script("arguments[0].click();", states_btn)
+def ensure_columns(cols):
+    current = get_fields()
+    new_cols = [c for c in cols if c not in current]
 
+    if not new_cols:
+        return
+
+    updated = current + new_cols
+    rows = []
+
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=updated, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[CSV] Added columns: {new_cols}")
+
+
+def upsert_row(new_row):
+    ensure_columns(new_row.keys())
+    fields = get_fields()
+
+    rows = []
+
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                if not all(r.get(k) == new_row[k] for k in KEY_FIELDS):
+                    rows.append(r)
+
+    rows.append(new_row)
+
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=FIXED_FIELDS).writeheader()
+
+
+# ==============================
+# JS SAFETY
+# ==============================
+
+def wait_for_js_function(name, timeout=10):
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script(f"return typeof {name} === 'function'")
+    )
+
+
+def safe_js(script):
+    for _ in range(3):
+        try:
+            return driver.execute_script(script)
+        except Exception:
+            time.sleep(1)
+    raise Exception(f"JS failed: {script}")
+
+
+# ==============================
+# NAVIGATION
+# ==============================
+
+def open_home():
+    driver.get(BASE_URL)
+    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+
+def change_month(year, month):
+    wait.until(EC.element_to_be_clickable((By.ID, "calModal"))).click()
+
+    wait.until(EC.presence_of_element_located((By.ID, "selectedyear")))
+    driver.execute_script("""
+        let y = document.getElementById('selectedyear');
+        y.value = arguments[0];
+        y.dispatchEvent(new Event('change'));
+    """, str(year))
+
+    months = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".cal_month a")))
+    months[month - 1].click()
+
+    time.sleep(2)
+
+
+def open_states_modal():
+    btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
+    btn.click()
     wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
 
-    states = driver.find_elements(By.CSS_SELECTOR, "#myModal11 a")
 
-    state_data = []
-    for s in states:
-        onclick = s.get_attribute("onclick") or ""
-        match = re.search(r"stateData\('(\d+)'\)", onclick)
+# ==============================
+# TABLE PARSER
+# ==============================
+
+def parse_table():
+    data = {}
+
+    tables = driver.find_elements(By.TAG_NAME, "table")
+
+    for table in tables:
+        try:
+            headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
+            if "Commodity" not in headers:
+                continue
+
+            rows = table.find_elements(By.TAG_NAME, "tr")
+
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) < 5:
+                    continue
+
+                name = cells[0].text.strip()
+                if name.lower() == "total":
+                    continue
+
+                val = cells[4].text.strip()
+                is_sub = "customRow" in (row.get_attribute("class") or "")
+
+                col = commodity_to_col(name, is_sub)
+                data[col] = val
+
+            return data
+
+        except:
+            continue
+
+    return data
+
+
+# ==============================
+# MAIN
+# ==============================
+
+try:
+    open_home()
+    change_month(TARGET_YEAR, TARGET_MONTH)
+    open_states_modal()
+
+    states = []
+    links = driver.find_elements(By.CSS_SELECTOR, "#myModal11 a")
+
+    for l in links:
+        onclick = l.get_attribute("onclick")
+        match = re.search(r"stateData\('(\d+)'\)", str(onclick))
         if match:
-            state_data.append({
-                "name": s.get_attribute("innerHTML").strip(),
+            states.append({
+                "name": l.text.strip(),
                 "code": match.group(1)
             })
 
-    for state in state_data[START_STATE:END_STATE]:
-        state_name = state["name"]
-        state_code = state["code"]
+    print(f"States found: {len(states)}")
 
-        print(f"\nSTATE: {state_name}")
+    for state in states[START_STATE:END_STATE]:
 
-        driver.get("https://impds.nic.in/sale/")
-        change_month(TARGET_YEAR, TARGET_MONTH)
+        print(f"\nSTATE: {state['name']}")
 
-        states_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
-        driver.execute_script("arguments[0].click();", states_btn)
+        open_home()
+        open_states_modal()
 
-        driver.execute_script(f"liveDistrictdata('{state_code}')")
+        # click state
+        for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
+            if state["code"] in (l.get_attribute("onclick") or ""):
+                l.click()
+                break
+
+        wait_for_js_function("liveDistrictdata")
+        safe_js(f"liveDistrictdata('{state['code']}')")
+
         time.sleep(2)
 
-        links = driver.find_elements(By.TAG_NAME, "a")
+        # districts
         districts = []
+        for l in driver.find_elements(By.TAG_NAME, "a"):
+            onclick = l.get_attribute("onclick")
+            if onclick and "stateData(" in onclick:
+                match = re.search(r"stateData\('(\d+)'\)", onclick)
+                if match:
+                    imgs = l.find_elements(By.TAG_NAME, "img")
+                    if imgs and imgs[0].get_attribute("width") == "12":
+                        districts.append({
+                            "name": imgs[0].get_attribute("aria-label"),
+                            "code": match.group(1)
+                        })
 
-        for link in links:
-            onclick = link.get_attribute("onclick") or ""
-            match = re.search(r"stateData\('(\d+)'\)", onclick)
-            if match:
-                imgs = link.find_elements(By.TAG_NAME, "img")
-                if imgs and imgs[0].get_attribute("width") == "12":
-                    districts.append({
-                        "name": imgs[0].get_attribute("aria-label").strip(),
-                        "code": match.group(1)
-                    })
-
+        # dedupe
         seen = set()
         districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
 
+        print(f"Districts: {len(districts)}")
+
         for d in districts:
-            district_name = d["name"]
-            district_code = d["code"]
+            try:
+                print(f"  -> {d['name']}")
 
-            print(f"District: {district_name}")
+                wait_for_js_function("stateData")
+                safe_js(f"stateData('{d['code']}')")
 
-            old_text = driver.find_element(By.TAG_NAME, "body").text
+                time.sleep(2)
 
-            driver.execute_script(f"stateData('{district_code}')")
+                commodities = parse_table()
 
-            wait.until(lambda drv: drv.find_element(By.TAG_NAME, "body").text != old_text)
+                row = {
+                    "state": state["name"],
+                    "district": d["name"],
+                    "district_code": d["code"],
+                    "date": f"{TARGET_YEAR}-{TARGET_MONTH:02d}",
+                    **commodities
+                }
 
-            commodity_data = parse_distributed_qty_table(driver)
+                upsert_row(row)
 
-            print("  ->", commodity_data.keys())
+                safe_js(f"backData('{state['code']}')")
 
-            row = {
-                "state": state_name,
-                "district": district_name,
-                "district_code": district_code,
-                "date": f"{TARGET_YEAR}-{TARGET_MONTH:02d}",
-                **commodity_data
-            }
+            except Exception as e:
+                print(f"District error: {e}")
+                try:
+                    safe_js(f"backData('{state['code']}')")
+                except:
+                    pass
 
-            append_row(row)
-
-            driver.execute_script(f"backData('{state_code}')")
-            time.sleep(1)
-
-except Exception as e:
-    print("ERROR:", e)
+except Exception:
+    import traceback
+    traceback.print_exc()
 
 finally:
+    print(f"\nDONE → {CSV_FILE}")
     driver.quit()
-    print("DONE")
