@@ -411,20 +411,29 @@ def parse_table():
                     # Parse sub-items from the panel div directly
                     if aria:
                         panel_id = aria.group(1)
+                        # Parse sub-items from the panel - search entire DOM including tbodys
                         try:
-                            panel = driver.find_element(By.ID, panel_id)
-                            panel_rows = panel.find_elements(By.TAG_NAME, "tr")
+                            panel_rows = driver.execute_script("""
+                                var panel = document.getElementById(arguments[0]);
+                                if (!panel) return [];
+                                var rows = panel.querySelectorAll('tr');
+                                return Array.from(rows).map(r => {
+                                    var cells = r.querySelectorAll('td');
+                                    if (cells.length === 0) return null;
+                                    return {
+                                        name: cells[0].innerText.trim(),
+                                        val: cells[arguments[1]] ? cells[arguments[1]].innerText.trim() : ''
+                                    };
+                                }).filter(x => x !== null);
+                            """, panel_id, val_col_idx)
+
                             for pr in panel_rows:
-                                pcells = pr.find_elements(By.TAG_NAME, "td")
-                                if len(pcells) < val_col_idx + 1:
-                                    continue
-                                pname = pcells[0].text.strip()
-                                if not pname:
-                                    pname = re.sub(r'<[^>]+>', '', pcells[0].get_attribute("innerHTML") or "").strip()
+                                pname = pr['name']
+                                pval = pr['val']
                                 if not pname or pname.lower() == "total":
                                     continue
-                                pval = pcells[val_col_idx].text.strip()
                                 data[commodity_to_col(pname, True)] = pval
+
                         except Exception as e:
                             print(f"Panel parse error ({panel_id}): {e}")
 
