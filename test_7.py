@@ -165,6 +165,12 @@ def open_states_modal():
 def parse_table():
     data = {}
 
+    # Expand all collapsed panels before reading
+    driver.execute_script("""
+        document.querySelectorAll('.menu-toggle[aria-expanded="false"]').forEach(btn => btn.click());
+    """)
+    time.sleep(0.5)
+
     tables = driver.find_elements(By.TAG_NAME, "table")
 
     for table in tables:
@@ -191,17 +197,19 @@ def parse_table():
 
                 cell_html = cells[0].get_attribute("innerHTML") or ""
                 name_raw = cells[0].text.strip()
+
+                # Fallback: strip tags from HTML if text is empty
+                if not name_raw:
+                    name_raw = re.sub(r'<[^>]+>', '', cell_html).strip()
+
                 val = cells[val_col_idx].text.strip()
 
                 if not name_raw and "menu-toggle" not in cell_html:
                     continue
 
-                # Row with menu-toggle button = collapsible parent (e.g. "Coarse Grains")
                 if "menu-toggle" in cell_html:
-                    # Extract name from button text or aria-controls
-                    import re as _re
-                    aria = _re.search(r'aria-controls="([^"]+)"', cell_html)
-                    btn_text = _re.search(r'</i>\s*([^<]+)', cell_html)
+                    aria = re.search(r'aria-controls="([^"]+)"', cell_html)
+                    btn_text = re.search(r'</i>\s*([^<]+)', cell_html)
                     if btn_text:
                         name_raw = btn_text.group(1).strip()
                     elif aria:
@@ -215,15 +223,8 @@ def parse_table():
                     in_sub_section = False
                     continue
 
-                # If name looks like a new top-level item after sub-section ended
-                # (no indent, no button) — reset sub-section flag
-                # We detect top-level by checking if it's NOT indented
-                # Since all styles are empty, we rely on position after "total" or start
                 col = commodity_to_col(name_raw, in_sub_section)
                 data[col] = val
-
-                # If we see a plain named row after sub-items, it could be new top-level
-                # Reset only when we hit "total" (handled above)
 
             return data
 
@@ -232,8 +233,6 @@ def parse_table():
             continue
 
     return data
-
-
 # ==============================
 # MAIN
 # ==============================
