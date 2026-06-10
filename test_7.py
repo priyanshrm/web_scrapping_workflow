@@ -167,120 +167,43 @@ def open_states_modal():
 # TABLE PARSER
 # ==============================
 
-def parse_table():
-    data = {}
+def parse_table() -> dict:
+    commodity_data = {}
 
-    # Force expand all panels
-    driver.execute_script("""
-        document.querySelectorAll('.menu-toggle').forEach(btn => {
-            btn.setAttribute('aria-expanded', 'true');
-        });
-        document.querySelectorAll('[id$="Panel"]').forEach(panel => {
-            panel.style.display = '';
-            panel.style.visibility = 'visible';
-            panel.removeAttribute('hidden');
-            panel.classList.remove('collapse', 'collapsed');
-            panel.classList.add('show');
-        });
-    """)
-    time.sleep(0.5)
-
-    tables = driver.find_elements(By.TAG_NAME, "table")
-
-    for table in tables:
+    for table in driver.find_elements(By.TAG_NAME, "table"):
         try:
             headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-            if "Commodity" not in headers:
+            if "Commodity" not in headers or "Total" not in headers:
                 continue
 
-            val_col_idx = None
-            for i, h in enumerate(headers):
-                if h.lower() in ("quantity", "offtake", "value", "amount", "qty", "total"):
-                    val_col_idx = i
-                    break
-            if val_col_idx is None:
-                val_col_idx = 4
-
-            rows = table.find_elements(By.TAG_NAME, "tr")
-            in_sub_section = False
-            parent_col = None
-
-            for row in rows:
+            for row in table.find_elements(By.TAG_NAME, "tr"):
                 cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) < val_col_idx + 1:
+                if len(cells) < 5:
                     continue
 
-                cell_html = cells[0].get_attribute("innerHTML") or ""
                 name_raw = cells[0].text.strip()
-
-                if not name_raw:
-                    name_raw = re.sub(r'<[^>]+>', '', cell_html).strip()
-
-                val = cells[val_col_idx].text.strip()
-
-                if not name_raw and "menu-toggle" not in cell_html:
+                if not name_raw or name_raw.lower() == "total":
                     continue
 
-                if "menu-toggle" in cell_html:
-                    btn_text = re.search(r'</i>\s*([^<]+)', cell_html)
-                    aria = re.search(r'aria-controls="([^"]+)"', cell_html)
-                    if btn_text:
-                        name_raw = btn_text.group(1).strip()
-                    elif aria:
-                        name_raw = aria.group(1).replace("Panel", "").replace("_", " ").title()
+                # Skip the menu-toggle button row (parent "Coarse Grains" activator)
+                # but still capture its value
+                btn = cells[0].find_elements(By.CLASS_NAME, "menu-toggle")
+                if btn:
+                    name_raw = btn[0].text.strip()
 
-                    col = commodity_to_col(name_raw, False)
-                    data[col] = val
-                    parent_col = col
-                    in_sub_section = True
+                val = cells[4].text.strip()
+                row_classes = row.get_attribute("class") or ""
+                is_sub = "customRow" in row_classes
 
-                    # Parse sub-items from the panel div directly
-                    if aria:
-                        panel_id = aria.group(1)
-                        # Parse sub-items from the panel - search entire DOM including tbodys
-                        try:
-                            panel_rows = driver.execute_script("""
-                                var panel = document.getElementById(arguments[0]);
-                                if (!panel) return [];
-                                var rows = panel.querySelectorAll('tr');
-                                return Array.from(rows).map(r => {
-                                    var cells = r.querySelectorAll('td');
-                                    if (cells.length === 0) return null;
-                                    return {
-                                        name: cells[0].innerText.trim(),
-                                        val: cells[arguments[1]] ? cells[arguments[1]].innerText.trim() : ''
-                                    };
-                                }).filter(x => x !== null);
-                            """, panel_id, val_col_idx)
+                commodity_data[commodity_to_col(name_raw, is_sub)] = val
 
-                            for pr in panel_rows:
-                                pname = pr['name']
-                                pval = pr['val']
-                                if not pname or pname.lower() == "total":
-                                    continue
-                                data[commodity_to_col(pname, True)] = pval
-
-                        except Exception as e:
-                            print(f"Panel parse error ({panel_id}): {e}")
-
-                    in_sub_section = False
-                    continue
-
-                if name_raw.lower() == "total":
-                    in_sub_section = False
-                    continue
-
-                col = commodity_to_col(name_raw, in_sub_section)
-                data[col] = val
-
-            return data
+            return commodity_data  # found and parsed the right table
 
         except Exception as e:
             print(f"Table parse error: {e}")
-            continue
 
-    return data
-
+    print("  [WARN] Could not find Distributed Quantity table")
+    return commodity_data
 # ==============================
 # MAIN
 # ==============================
