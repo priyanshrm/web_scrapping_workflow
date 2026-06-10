@@ -156,52 +156,62 @@ def open_states_modal():
 
 def wait_for_district_page(district_name, timeout=15):
     """
-    Wait until the page header/breadcrumb shows the expected district name.
-    This is the only reliable way to confirm the correct district data is loaded.
-    Also waits for the Distributed Quantity table to be present.
+    Wait until the page is showing the specific district's data.
+
+    The district page has a breadcrumb element:
+        <div class="status m_menu" key="district">SOUTH ANDAMANS</div>
+
+    The national/state page does NOT have this element with the district name.
+    This is the reliable signal that the correct district data is loaded.
     """
     district_upper = district_name.strip().upper()
 
-    def correct_page_loaded(d):
+    def correct_district_loaded(d):
         try:
-            # Check page text contains the district name (breadcrumb/header area)
-            page_text = d.execute_script(
-                "return document.body.innerText.toUpperCase();"
-            )
-            if district_upper not in page_text:
-                return False
-
-            # Also confirm the Distributed Quantity table is present
-            has_table = d.execute_script("""
-                var tables = document.querySelectorAll('table');
-                for (var t of tables) {
-                    var ths = Array.from(t.querySelectorAll('th')).map(function(h){
-                        return h.innerText.trim();
-                    });
-                    if (ths.indexOf('Commodity') !== -1 && ths.indexOf('Total') !== -1) {
-                        return true;
-                    }
+            # Look for the district breadcrumb div that shows the district name.
+            # On the district page: <div class="status m_menu" key="district">DISTRICT NAME</div>
+            result = d.execute_script("""
+                var els = document.querySelectorAll('[key="district"]');
+                for (var i = 0; i < els.length; i++) {
+                    var text = els[i].innerText.trim().toUpperCase();
+                    if (text === arguments[0]) return true;
                 }
                 return false;
-            """)
-            return has_table
+            """, district_upper)
+            return result
         except Exception:
             return False
 
-    WebDriverWait(driver, timeout).until(correct_page_loaded)
-    time.sleep(0.5)
+    WebDriverWait(driver, timeout).until(correct_district_loaded)
+    time.sleep(0.5)  # small buffer for table to fully render
 
 
 # ==============================
 # TABLE PARSER — pure JS, no Selenium element refs
 # ==============================
 
+# Extracts all commodity rows from the Distributed Quantity table via JS.
+# Specifically targets the table with aria-label="Distributed Quantity(In MT)"
+# to avoid accidentally parsing the national-level table.
 PARSE_TABLE_JS = """
     var result = [];
     var tables = document.querySelectorAll('table');
     for (var t of tables) {
+        // Identify the right table by aria-label (most reliable)
+        var ariaLabel = t.getAttribute('aria-label') || '';
         var ths = Array.from(t.querySelectorAll('th')).map(function(h){ return h.innerText.trim(); });
-        if (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1) continue;
+        if (ariaLabel.indexOf('Distributed Quantity') === -1 &&
+            (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1)) continue;
+
+        // Skip tables inside #stateDefaultDivId (national view)
+        var inDefault = false;
+        var parent = t.parentElement;
+        while (parent) {
+            if (parent.id === 'stateDefaultDivId') { inDefault = true; break; }
+            parent = parent.parentElement;
+        }
+        if (inDefault) continue;
+
         var rows = t.querySelectorAll('tr');
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
@@ -224,14 +234,14 @@ PARSE_TABLE_JS = """
 
             result.push({name: name, val: val, isSub: isSub});
         }
-        return result;
+        return result;  // found and parsed the right table
     }
     return result;
 """
 
 
 def parse_table() -> dict:
-    """Extract all commodity data from the table entirely via JS."""
+    """Extract all commodity data from the district Distributed Quantity table via JS."""
     try:
         rows = driver.execute_script(PARSE_TABLE_JS)
     except Exception as e:
@@ -310,12 +320,12 @@ try:
 
         for d in districts:
             try:
-                print(f"  -> {d['name']}")
+                print(f"  -> {d['name']} (code: {d['code']})")
 
                 wait_for_js_function("stateData")
                 safe_js(f"stateData('{d['code']}')")
 
-                # Wait until the page actually shows THIS district's name + table
+                # Wait until the page breadcrumb confirms this specific district is loaded
                 wait_for_district_page(d["name"])
 
                 commodities = parse_table()
@@ -337,7 +347,7 @@ try:
                 time.sleep(1)
 
             except Exception as e:
-                print(f"District error: {e}")
+                print(f"  District error ({d['name']}): {e}")
                 try:
                     safe_js(f"backData('{state['code']}')")
                     time.sleep(1)
