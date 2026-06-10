@@ -106,7 +106,7 @@ if not os.path.exists(CSV_FILE):
 # JS SAFETY
 # ==============================
 
-def wait_for_js_function(name, timeout=10):
+def wait_for_js_function(name, timeout=15):
     WebDriverWait(driver, timeout).until(
         lambda d: d.execute_script(f"return typeof {name} === 'function'")
     )
@@ -128,6 +128,10 @@ def safe_js(script):
 def open_home():
     driver.get(BASE_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    # Wait for the main dashboard JS to be available
+    WebDriverWait(driver, 20).until(
+        lambda d: d.execute_script("return typeof stateData === 'function'")
+    )
 
 
 def change_month(year, month):
@@ -144,125 +148,112 @@ def change_month(year, month):
     time.sleep(2)
 
 
-def open_states_modal():
+def navigate_to_state(state_code):
+    """Navigate from home to a state's district map view."""
+    open_home()
+    change_month(TARGET_YEAR, TARGET_MONTH)
+
+    # Open states modal
     btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
     btn.click()
     wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
 
+    # Click state link in modal
+    clicked = False
+    for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
+        if state_code in (l.get_attribute("onclick") or ""):
+            l.click()
+            clicked = True
+            break
+    if not clicked:
+        raise Exception(f"State link not found for code {state_code}")
 
-# ==============================
-# WAIT HELPERS
-# ==============================
-
-def wait_for_district_page(district_name, timeout=15):
-    """Wait until the district breadcrumb confirms this district is loaded."""
-    district_upper = district_name.strip().upper()
-
-    def correct_district_loaded(d):
-        try:
-            result = d.execute_script("""
-                var els = document.querySelectorAll('[key="district"]');
-                for (var i = 0; i < els.length; i++) {
-                    var text = els[i].innerText.trim().toUpperCase();
-                    if (text === arguments[0]) return true;
-                }
-                return false;
-            """, district_upper)
-            return result
-        except Exception:
-            return False
-
-    WebDriverWait(driver, timeout).until(correct_district_loaded)
-    time.sleep(0.5)
+    # Wait for state map to load (stateDefaultDivId hidden, stateDivId shown with district blinkicons)
+    WebDriverWait(driver, 15).until(
+        lambda d: len(d.find_elements(By.CSS_SELECTOR, ".blink_icon_img")) > 0
+    )
+    time.sleep(1)
 
 
-def wait_for_state_page(timeout=10):
-    """Wait until district breadcrumb is cleared (back to state view)."""
-    def state_view_loaded(d):
-        try:
-            return d.execute_script("""
-                var els = document.querySelectorAll('[key="district"]');
-                for (var i = 0; i < els.length; i++) {
-                    if (els[i].innerText.trim() !== '') return false;
-                }
-                var stEls = document.querySelectorAll('[key="state"]');
-                for (var i = 0; i < stEls.length; i++) {
-                    if (stEls[i].innerText.trim() !== '') return true;
-                }
-                return false;
-            """)
-        except Exception:
-            return False
-
-    WebDriverWait(driver, timeout).until(state_view_loaded)
-    time.sleep(0.3)
-
-
-# ==============================
-# DISTRICT NAVIGATION
-# ==============================
-
-def navigate_to_district(district_code, district_name, state_code, retries=3):
-    """Navigate to a district using DistrictData() JS call with retry logic."""
-    for attempt in range(retries):
-        try:
-            if attempt > 0:
-                print(f"    [RETRY {attempt}] {district_name}")
-                try:
-                    safe_js(f"backData('{state_code}')")
-                    time.sleep(2)
-                except Exception:
-                    pass
-
-            wait_for_js_function("DistrictData")
-            safe_js(f"DistrictData('{district_code}')")
-            wait_for_district_page(district_name, timeout=15)
-            return True
-
-        except Exception as e:
-            print(f"    [WARN] Attempt {attempt+1} failed for {district_name}: {e}")
-            time.sleep(2)
-
-    return False
-
-
-def back_to_state(state_code, timeout=10):
-    """Go back to state view and confirm district breadcrumb is cleared."""
-    safe_js(f"backData('{state_code}')")
-    wait_for_state_page(timeout=timeout)
-
-
-# ==============================
-# COLLECT DISTRICTS FROM MAP DOTS
-# ==============================
-
-def collect_districts():
+def get_districts_for_state(state_code):
     """
-    Collect districts from the blinking map dot links.
-    The HTML uses: <a onclick="DistrictData('638')"><img aria-label="NICOBARS" ...></a>
-    This is the correct and complete source for all districts.
+    After calling navigate_to_state(), collect all district links.
+    Districts are the blinking icons on the map with onclick="DistrictData('NNN')"
+    or stateData calls with img width=12.
     """
     districts = []
     seen = set()
 
-    imgs = driver.find_elements(By.CSS_SELECTOR, "img.map[aria-label]")
-    for img in imgs:
-        try:
-            parent_a = img.find_element(By.XPATH, "..")
-            onclick = parent_a.get_attribute("onclick") or ""
-            match = re.search(r"DistrictData\('(\d+)'\)", onclick)
-            if not match:
-                continue
-            code = match.group(1)
-            name = (img.get_attribute("aria-label") or
-                    img.get_attribute("title") or "").strip()
-            if code and name and code not in seen:
-                districts.append({"name": name, "code": code})
+    # The district-level blink icons use DistrictData() or stateData() with img[width=12]
+    for a in driver.find_elements(By.TAG_NAME, "a"):
+        onclick = a.get_attribute("onclick") or ""
+
+        # Try DistrictData pattern first
+        m = re.search(r"DistrictData\('(\d+)'\)", onclick)
+        if m:
+            code = m.group(1)
+            if code not in seen:
                 seen.add(code)
-        except Exception:
+                imgs = a.find_elements(By.TAG_NAME, "img")
+                name = imgs[0].get_attribute("aria-label") if imgs else a.get_attribute("title") or code
+                districts.append({"name": name, "code": code})
             continue
 
+        # Fallback: stateData with small blinking icon
+        m = re.search(r"stateData\('(\d+)'\)", onclick)
+        if m:
+            code = m.group(1)
+            if code not in seen:
+                imgs = a.find_elements(By.TAG_NAME, "img")
+                if imgs and imgs[0].get_attribute("width") == "12":
+                    seen.add(code)
+                    name = imgs[0].get_attribute("aria-label") or code
+                    districts.append({"name": name, "code": code})
+
     return districts
+
+
+# ==============================
+# WAIT FOR CORRECT DISTRICT PAGE
+# ==============================
+
+def wait_for_district_page(district_code, timeout=20):
+    """
+    Wait until the district data page is loaded for the given district code.
+
+    Strategy: wait for the Distributed Quantity table to appear inside #stateDivId
+    AND verify it is NOT inside #stateDefaultDivId (which is the national view).
+    We use the back button element (aria-label="Go back") as the reliable signal
+    that we are on a district page, not a state or national page.
+    """
+    def district_loaded(d):
+        try:
+            # Check for the back button that only appears on district pages
+            back_btns = d.find_elements(By.CSS_SELECTOR, "i.fa-hand-o-left")
+            if not back_btns:
+                return False
+
+            # Also check that the Distributed Quantity table is present
+            # and not inside stateDefaultDivId
+            result = d.execute_script("""
+                var tables = document.querySelectorAll('table[aria-label*="Distributed Quantity"]');
+                for (var t of tables) {
+                    var parent = t.parentElement;
+                    var inDefault = false;
+                    while (parent) {
+                        if (parent.id === 'stateDefaultDivId') { inDefault = true; break; }
+                        parent = parent.parentElement;
+                    }
+                    if (!inDefault) return true;
+                }
+                return false;
+            """)
+            return bool(result)
+        except Exception:
+            return False
+
+    WebDriverWait(driver, timeout).until(district_loaded)
+    time.sleep(0.5)
 
 
 # ==============================
@@ -278,6 +269,7 @@ PARSE_TABLE_JS = """
         if (ariaLabel.indexOf('Distributed Quantity') === -1 &&
             (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1)) continue;
 
+        // Skip tables inside #stateDefaultDivId (national view)
         var inDefault = false;
         var parent = t.parentElement;
         while (parent) {
@@ -313,7 +305,7 @@ PARSE_TABLE_JS = """
 """
 
 
-def parse_table():
+def parse_table() -> dict:
     try:
         rows = driver.execute_script(PARSE_TABLE_JS)
     except Exception as e:
@@ -333,68 +325,90 @@ def parse_table():
 
 
 # ==============================
+# NAVIGATE TO SPECIFIC DISTRICT
+# ==============================
+
+def navigate_to_district(state_code, district_code, district_name):
+    """
+    Navigate fresh to a district page:
+    1. Load home
+    2. Set month/year
+    3. Call stateData(state_code) to get to state view
+    4. Call stateData(district_code) to get to district view
+    5. Wait for district page to be confirmed loaded
+    """
+    open_home()
+    change_month(TARGET_YEAR, TARGET_MONTH)
+
+    # Navigate to state first
+    wait_for_js_function("stateData")
+    safe_js(f"stateData('{state_code}')")
+    WebDriverWait(driver, 15).until(
+        lambda d: len(d.find_elements(By.CSS_SELECTOR, ".blink_icon_img")) > 0
+    )
+    time.sleep(1)
+
+    # Navigate to district
+    wait_for_js_function("stateData")
+    safe_js(f"stateData('{district_code}')")
+
+    # Wait for district page to confirm load
+    wait_for_district_page(district_code)
+
+
+# ==============================
 # MAIN
 # ==============================
 
 try:
+    # ---- collect state list ----
     open_home()
     change_month(TARGET_YEAR, TARGET_MONTH)
-    open_states_modal()
 
-    # Collect all states
+    btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
+    btn.click()
+    wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
+
     states = []
-    links = driver.find_elements(By.CSS_SELECTOR, "#myModal11 a")
-    for l in links:
+    for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
         onclick = l.get_attribute("onclick")
         match = re.search(r"stateData\('(\d+)'\)", str(onclick))
         if match:
-            states.append({
-                "name": l.text.strip(),
-                "code": match.group(1)
-            })
+            states.append({"name": l.text.strip(), "code": match.group(1)})
+
+    # Close modal before navigating
+    driver.execute_script(
+        "var m = document.getElementById('myModal11'); if(m) m.style.display='none';"
+    )
 
     print(f"States found: {len(states)}")
 
     for state in states[START_STATE:END_STATE]:
         print(f"\nSTATE: {state['name']}")
 
-        open_home()
-        open_states_modal()
+        # Navigate to state to collect district list
+        navigate_to_state(state["code"])
+        districts = get_districts_for_state(state["code"])
 
-        # Click into the state
-        for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
-            if state["code"] in (l.get_attribute("onclick") or ""):
-                l.click()
-                break
-
-        wait_for_js_function("liveDistrictdata")
-        safe_js(f"liveDistrictdata('{state['code']}')")
-        time.sleep(2)
-
-        # Collect districts from map dots using DistrictData()
-        districts = collect_districts()
+        # dedupe
+        seen = set()
+        districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
         print(f"Districts: {len(districts)}")
 
-        if not districts:
-            print(f"  [WARN] No districts found for {state['name']}, skipping.")
-            continue
-
         for d in districts:
-            print(f"  -> {d['name']} (code: {d['code']})")
-
-            success = navigate_to_district(d["code"], d["name"], state["code"])
-            if not success:
-                print(f"  [SKIP] {d['name']} — failed after retries")
-                try:
-                    back_to_state(state["code"])
-                except Exception:
-                    pass
-                continue
-
             try:
+                print(f"  -> {d['name']} (code: {d['code']})")
+
+                # Fresh navigation for every district
+                navigate_to_district(state["code"], d["code"], d["name"])
+
                 commodities = parse_table()
                 print(f"    Columns: {list(commodities.keys())}")
                 print(f"    Values:  {commodities}")
+
+                if not commodities:
+                    print(f"  [SKIP] No commodity data for {d['name']}")
+                    continue
 
                 row = {
                     "state": state["name"],
@@ -408,13 +422,9 @@ try:
                 upsert_row(row)
 
             except Exception as e:
-                print(f"  [ERROR] Parsing/saving {d['name']}: {e}")
-
-            try:
-                back_to_state(state["code"])
-            except Exception as e:
-                print(f"  [WARN] backData failed after {d['name']}: {e}")
-                time.sleep(1)
+                print(f"  District error ({d['name']}): {e}")
+                import traceback
+                traceback.print_exc()
 
 except Exception:
     import traceback
