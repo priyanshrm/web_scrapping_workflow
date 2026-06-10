@@ -166,15 +166,47 @@ def open_states_modal():
 # TABLE HELPERS
 # ==============================
 
-def wait_for_table():
-    """Wait until the Distributed Quantity table is present and has data rows."""
-    WebDriverWait(driver, 15).until(
-        lambda d: any(
-            "Commodity" in [h.text.strip() for h in t.find_elements(By.TAG_NAME, "th")]
-            for t in d.find_elements(By.TAG_NAME, "table")
-        )
-    )
-    time.sleep(1)  # small buffer for full render
+def wait_for_table(old_first_val=None):
+    """
+    Wait until the Distributed Quantity table is present with fresh data.
+    If old_first_val is given, waits for the table's first data cell to change
+    from that value — ensuring stale DOM from previous district is gone.
+    """
+    def table_is_fresh(d):
+        tables = d.find_elements(By.TAG_NAME, "table")
+        for t in tables:
+            headers = [h.text.strip() for h in t.find_elements(By.TAG_NAME, "th")]
+            if "Commodity" not in headers or "Total" not in headers:
+                continue
+            rows = t.find_elements(By.TAG_NAME, "tr")
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 5:
+                    first_val = cells[4].text.strip()
+                    # If we have a stale reference, wait until it changes
+                    if old_first_val is not None:
+                        return first_val != old_first_val and first_val != ""
+                    return first_val != ""
+        return False
+
+    WebDriverWait(driver, 15).until(table_is_fresh)
+    time.sleep(0.5)  # small buffer for full render
+
+
+def get_first_table_val():
+    """Get the first data cell value from the Distributed Quantity table (used as stale marker)."""
+    try:
+        for table in driver.find_elements(By.TAG_NAME, "table"):
+            headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
+            if "Commodity" not in headers or "Total" not in headers:
+                continue
+            for row in table.find_elements(By.TAG_NAME, "tr"):
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 5:
+                    return cells[4].text.strip()
+    except Exception:
+        pass
+    return None
 
 
 def get_cell_text(cell):
@@ -293,6 +325,8 @@ try:
 
         print(f"Districts: {len(districts)}")
 
+        old_val = None  # stale marker for first district (no previous table)
+
         for d in districts:
             try:
                 print(f"  -> {d['name']}")
@@ -300,10 +334,14 @@ try:
                 wait_for_js_function("stateData")
                 safe_js(f"stateData('{d['code']}')")
 
-                wait_for_table()  # wait for table to be present before parsing
+                # Wait for new table to load, ensuring stale table is gone
+                wait_for_table(old_first_val=old_val)
 
                 commodities = parse_table()
-                print(f"    Columns: {list(commodities.keys())}")  # verify sub-items
+                print(f"    Columns: {list(commodities.keys())}")
+
+                # Capture current table's first value as stale marker for next iteration
+                old_val = get_first_table_val()
 
                 row = {
                     "state": state["name"],
@@ -321,6 +359,7 @@ try:
 
             except Exception as e:
                 print(f"District error: {e}")
+                old_val = None  # reset stale marker on error
                 try:
                     safe_js(f"backData('{state['code']}')")
                     time.sleep(1)
