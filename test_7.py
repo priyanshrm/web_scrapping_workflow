@@ -60,22 +60,17 @@ def get_fields():
 def ensure_columns(cols):
     current = get_fields()
     new_cols = [c for c in cols if c not in current]
-
     if not new_cols:
         return
-
     updated = current + new_cols
     rows = []
-
     if os.path.exists(CSV_FILE):
         with open(CSV_FILE, "r", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
-
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=updated, restval="")
         writer.writeheader()
         writer.writerows(rows)
-
     print(f"[CSV] Added columns: {new_cols}")
 
 
@@ -88,7 +83,6 @@ def fill_missing_sub_columns(row):
 def upsert_row(new_row):
     ensure_columns(new_row.keys())
     fields = get_fields()
-
     rows = []
     if os.path.exists(CSV_FILE):
         with open(CSV_FILE, "r", encoding="utf-8") as f:
@@ -96,9 +90,7 @@ def upsert_row(new_row):
             for r in reader:
                 if not all(r.get(k) == new_row[k] for k in KEY_FIELDS):
                     rows.append(r)
-
     rows.append(new_row)
-
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, restval="")
         writer.writeheader()
@@ -141,18 +133,14 @@ def open_home():
 def change_month(year, month):
     wait.until(EC.element_to_be_clickable((By.ID, "calModal"))).click()
     wait.until(EC.presence_of_element_located((By.ID, "selectedyear")))
-
     driver.execute_script("""
         let y = document.getElementById('selectedyear');
         y.value = arguments[0];
         y.dispatchEvent(new Event('change'));
     """, str(year))
-
     time.sleep(1)
-
     months = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".cal_month a")))
     driver.execute_script("arguments[0].click();", months[month - 1])
-
     time.sleep(2)
 
 
@@ -163,104 +151,99 @@ def open_states_modal():
 
 
 # ==============================
-# TABLE HELPERS
+# TABLE HELPERS — all JS, no Selenium element references
 # ==============================
 
+# Extracts the first data value from the table via JS (used as stale marker)
+GET_FIRST_VAL_JS = """
+    var tables = document.querySelectorAll('table');
+    for (var t of tables) {
+        var ths = Array.from(t.querySelectorAll('th')).map(function(h){ return h.innerText.trim(); });
+        if (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1) continue;
+        var rows = t.querySelectorAll('tr');
+        for (var i = 0; i < rows.length; i++) {
+            var cells = rows[i].querySelectorAll('td');
+            if (cells.length >= 5) return cells[4].innerText.trim();
+        }
+    }
+    return null;
+"""
+
+# Extracts all commodity rows from the table via JS
+# Returns list of {name, val, isSub}
+PARSE_TABLE_JS = """
+    var result = [];
+    var tables = document.querySelectorAll('table');
+    for (var t of tables) {
+        var ths = Array.from(t.querySelectorAll('th')).map(function(h){ return h.innerText.trim(); });
+        if (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1) continue;
+        var rows = t.querySelectorAll('tr');
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            var cells = row.querySelectorAll('td');
+            if (cells.length < 5) continue;
+
+            var nameCell = cells[0];
+            var name = nameCell.innerText.trim();
+
+            // menu-toggle parent row (e.g. Coarse Grains)
+            var btn = nameCell.querySelector('.menu-toggle');
+            if (btn) {
+                name = btn.innerText.trim();
+            }
+
+            if (!name || name.toLowerCase() === 'total') continue;
+
+            var val = cells[4].innerText.trim();
+            var isSub = row.className.indexOf('customRow') !== -1;
+
+            result.push({name: name, val: val, isSub: isSub});
+        }
+        return result;  // found and parsed the right table
+    }
+    return result;
+"""
+
+
 def wait_for_table(old_first_val=None):
-    """
-    Wait until the Distributed Quantity table is present with fresh data.
-    If old_first_val is given, waits for the table's first data cell to change
-    from that value — ensuring stale DOM from previous district is gone.
-    """
+    """Wait for the Distributed Quantity table to load fresh data, entirely via JS."""
     def table_is_fresh(d):
-        tables = d.find_elements(By.TAG_NAME, "table")
-        for t in tables:
-            headers = [h.text.strip() for h in t.find_elements(By.TAG_NAME, "th")]
-            if "Commodity" not in headers or "Total" not in headers:
-                continue
-            rows = t.find_elements(By.TAG_NAME, "tr")
-            for row in rows:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) >= 5:
-                    first_val = cells[4].text.strip()
-                    # If we have a stale reference, wait until it changes
-                    if old_first_val is not None:
-                        return first_val != old_first_val and first_val != ""
-                    return first_val != ""
-        return False
+        val = d.execute_script(GET_FIRST_VAL_JS)
+        if not val:
+            return False
+        if old_first_val is not None:
+            return val != old_first_val
+        return True
 
     WebDriverWait(driver, 15).until(table_is_fresh)
-    time.sleep(0.5)  # small buffer for full render
+    time.sleep(0.5)
 
 
 def get_first_table_val():
-    """Get the first data cell value from the Distributed Quantity table (used as stale marker)."""
+    """Snapshot the first data value for use as a stale marker."""
     try:
-        for table in driver.find_elements(By.TAG_NAME, "table"):
-            headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-            if "Commodity" not in headers or "Total" not in headers:
-                continue
-            for row in table.find_elements(By.TAG_NAME, "tr"):
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) >= 5:
-                    return cells[4].text.strip()
+        return driver.execute_script(GET_FIRST_VAL_JS)
     except Exception:
-        pass
-    return None
+        return None
 
-
-def get_cell_text(cell):
-    """Get text from a cell, including hidden elements."""
-    text = cell.text.strip()
-    if not text:
-        # fallback for hidden rows in headless
-        text = driver.execute_script("return arguments[0].innerText;", cell).strip()
-    return text
-
-
-# ==============================
-# TABLE PARSER
-# ==============================
 
 def parse_table() -> dict:
+    """Extract all commodity data from the table entirely via JS — no Selenium element refs."""
+    try:
+        rows = driver.execute_script(PARSE_TABLE_JS)
+    except Exception as e:
+        print(f"  [WARN] parse_table JS error: {e}")
+        return {}
+
+    if not rows:
+        print("  [WARN] Could not find Distributed Quantity table")
+        return {}
+
     commodity_data = {}
+    for r in rows:
+        col = commodity_to_col(r["name"], r["isSub"])
+        commodity_data[col] = r["val"]
 
-    for table in driver.find_elements(By.TAG_NAME, "table"):
-        try:
-            headers = [h.text.strip() for h in table.find_elements(By.TAG_NAME, "th")]
-            if "Commodity" not in headers or "Total" not in headers:
-                continue
-
-            for row in table.find_elements(By.TAG_NAME, "tr"):
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if len(cells) < 5:
-                    continue
-
-                # Use innerText fallback for hidden rows
-                name_raw = get_cell_text(cells[0])
-
-                # Strip button text if it's a menu-toggle parent row
-                btn = cells[0].find_elements(By.CLASS_NAME, "menu-toggle")
-                if btn:
-                    name_raw = driver.execute_script(
-                        "return arguments[0].innerText;", btn[0]
-                    ).strip()
-
-                if not name_raw or name_raw.lower() == "total":
-                    continue
-
-                val = get_cell_text(cells[4])
-                row_classes = row.get_attribute("class") or ""
-                is_sub = "customRow" in row_classes
-
-                commodity_data[commodity_to_col(name_raw, is_sub)] = val
-
-            return commodity_data
-
-        except Exception as e:
-            print(f"Table parse error: {e}")
-
-    print("  [WARN] Could not find Distributed Quantity table")
     return commodity_data
 
 
@@ -275,7 +258,6 @@ try:
 
     states = []
     links = driver.find_elements(By.CSS_SELECTOR, "#myModal11 a")
-
     for l in links:
         onclick = l.get_attribute("onclick")
         match = re.search(r"stateData\('(\d+)'\)", str(onclick))
@@ -302,10 +284,9 @@ try:
 
         wait_for_js_function("liveDistrictdata")
         safe_js(f"liveDistrictdata('{state['code']}')")
-
         time.sleep(2)
 
-        # districts
+        # collect districts
         districts = []
         for l in driver.find_elements(By.TAG_NAME, "a"):
             onclick = l.get_attribute("onclick")
@@ -322,10 +303,9 @@ try:
         # dedupe
         seen = set()
         districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
-
         print(f"Districts: {len(districts)}")
 
-        old_val = None  # stale marker for first district (no previous table)
+        old_val = None  # stale marker; None for first district
 
         for d in districts:
             try:
@@ -334,13 +314,13 @@ try:
                 wait_for_js_function("stateData")
                 safe_js(f"stateData('{d['code']}')")
 
-                # Wait for new table to load, ensuring stale table is gone
+                # Wait until table has fresh data (different from previous district)
                 wait_for_table(old_first_val=old_val)
 
                 commodities = parse_table()
                 print(f"    Columns: {list(commodities.keys())}")
 
-                # Capture current table's first value as stale marker for next iteration
+                # Snapshot for next iteration's stale check
                 old_val = get_first_table_val()
 
                 row = {
@@ -363,7 +343,7 @@ try:
                 try:
                     safe_js(f"backData('{state['code']}')")
                     time.sleep(1)
-                except:
+                except Exception:
                     pass
 
 except Exception:
