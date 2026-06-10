@@ -1,4 +1,3 @@
-import re
 import time
 import csv
 import os
@@ -115,15 +114,26 @@ def open_states_modal():
     wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
 
 # ==============================
-# CRITICAL FIX (WAIT FOR DISTRICTS)
+# FIXED WAIT FOR DISTRICTS
 # ==============================
 
 def wait_for_districts():
     WebDriverWait(driver, 20).until(
-        lambda d: len(d.execute_script("""
+        lambda d: d.execute_script("""
             return document.querySelectorAll('a[onclick*="DistrictData"]').length;
-        """)) > 0
+        """) > 0
     )
+
+# retry wrapper (important for GitHub)
+def load_state_with_retry(code, retries=3):
+    for i in range(retries):
+        driver.execute_script(f"stateData('{code}')")
+        try:
+            wait_for_districts()
+            return True
+        except:
+            time.sleep(2)
+    return False
 
 # ==============================
 # JS HELPERS
@@ -172,10 +182,6 @@ t.querySelectorAll('tr').forEach(r => {
 return result;
 """
 
-# ==============================
-# WAIT DISTRICT PAGE
-# ==============================
-
 def wait_for_district(name):
     target = name.upper().strip()
     WebDriverWait(driver, 15).until(
@@ -207,21 +213,20 @@ try:
 
         open_home()
         open_states_modal()
+        time.sleep(1)
 
-        driver.execute_script(f"stateData('{state['code']}')")
-
-        # 🔥 FIX: wait for districts properly
-        wait_for_districts()
+        if not load_state_with_retry(state["code"]):
+            print("Failed to load districts, skipping state")
+            continue
 
         districts = driver.execute_script(GET_DISTRICTS_JS)
         print(f"Districts: {len(districts)}")
 
         for d in districts:
             try:
-                print(f"  -> {d['name']} ({d['code']})")
+                print(f"  -> {d['name']}")
 
                 driver.execute_script(f"DistrictData('{d['code']}')")
-
                 wait_for_district(d["name"])
 
                 rows = driver.execute_script(PARSE_TABLE_JS)
@@ -241,13 +246,11 @@ try:
 
                 upsert_row(row)
 
-                driver.execute_script(f"stateData('{state['code']}')")
-                wait_for_districts()
+                load_state_with_retry(state["code"])
 
             except Exception as e:
                 print(f"  ERROR: {d['name']} -> {e}")
-                driver.execute_script(f"stateData('{state['code']}')")
-                wait_for_districts()
+                load_state_with_retry(state["code"])
 
 finally:
     print(f"\nDONE → {CSV_FILE}")
