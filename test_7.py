@@ -151,26 +151,51 @@ def open_states_modal():
 
 
 # ==============================
-# TABLE HELPERS — all JS, no Selenium element references
+# WAIT FOR CORRECT DISTRICT PAGE
 # ==============================
 
-# Extracts the first data value from the table via JS (used as stale marker)
-GET_FIRST_VAL_JS = """
-    var tables = document.querySelectorAll('table');
-    for (var t of tables) {
-        var ths = Array.from(t.querySelectorAll('th')).map(function(h){ return h.innerText.trim(); });
-        if (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1) continue;
-        var rows = t.querySelectorAll('tr');
-        for (var i = 0; i < rows.length; i++) {
-            var cells = rows[i].querySelectorAll('td');
-            if (cells.length >= 5) return cells[4].innerText.trim();
-        }
-    }
-    return null;
-"""
+def wait_for_district_page(district_name, timeout=15):
+    """
+    Wait until the page header/breadcrumb shows the expected district name.
+    This is the only reliable way to confirm the correct district data is loaded.
+    Also waits for the Distributed Quantity table to be present.
+    """
+    district_upper = district_name.strip().upper()
 
-# Extracts all commodity rows from the table via JS
-# Returns list of {name, val, isSub}
+    def correct_page_loaded(d):
+        try:
+            # Check page text contains the district name (breadcrumb/header area)
+            page_text = d.execute_script(
+                "return document.body.innerText.toUpperCase();"
+            )
+            if district_upper not in page_text:
+                return False
+
+            # Also confirm the Distributed Quantity table is present
+            has_table = d.execute_script("""
+                var tables = document.querySelectorAll('table');
+                for (var t of tables) {
+                    var ths = Array.from(t.querySelectorAll('th')).map(function(h){
+                        return h.innerText.trim();
+                    });
+                    if (ths.indexOf('Commodity') !== -1 && ths.indexOf('Total') !== -1) {
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            return has_table
+        except Exception:
+            return False
+
+    WebDriverWait(driver, timeout).until(correct_page_loaded)
+    time.sleep(0.5)
+
+
+# ==============================
+# TABLE PARSER — pure JS, no Selenium element refs
+# ==============================
+
 PARSE_TABLE_JS = """
     var result = [];
     var tables = document.querySelectorAll('table');
@@ -199,36 +224,14 @@ PARSE_TABLE_JS = """
 
             result.push({name: name, val: val, isSub: isSub});
         }
-        return result;  // found and parsed the right table
+        return result;
     }
     return result;
 """
 
 
-def wait_for_table(old_first_val=None):
-    """Wait for the Distributed Quantity table to load fresh data, entirely via JS."""
-    def table_is_fresh(d):
-        val = d.execute_script(GET_FIRST_VAL_JS)
-        if not val:
-            return False
-        if old_first_val is not None:
-            return val != old_first_val
-        return True
-
-    WebDriverWait(driver, 15).until(table_is_fresh)
-    time.sleep(0.5)
-
-
-def get_first_table_val():
-    """Snapshot the first data value for use as a stale marker."""
-    try:
-        return driver.execute_script(GET_FIRST_VAL_JS)
-    except Exception:
-        return None
-
-
 def parse_table() -> dict:
-    """Extract all commodity data from the table entirely via JS — no Selenium element refs."""
+    """Extract all commodity data from the table entirely via JS."""
     try:
         rows = driver.execute_script(PARSE_TABLE_JS)
     except Exception as e:
@@ -305,8 +308,6 @@ try:
         districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
         print(f"Districts: {len(districts)}")
 
-        old_val = None  # stale marker; None for first district
-
         for d in districts:
             try:
                 print(f"  -> {d['name']}")
@@ -314,14 +315,12 @@ try:
                 wait_for_js_function("stateData")
                 safe_js(f"stateData('{d['code']}')")
 
-                # Wait until table has fresh data (different from previous district)
-                wait_for_table(old_first_val=old_val)
+                # Wait until the page actually shows THIS district's name + table
+                wait_for_district_page(d["name"])
 
                 commodities = parse_table()
                 print(f"    Columns: {list(commodities.keys())}")
-
-                # Snapshot for next iteration's stale check
-                old_val = get_first_table_val()
+                print(f"    Values:  {commodities}")
 
                 row = {
                     "state": state["name"],
@@ -339,7 +338,6 @@ try:
 
             except Exception as e:
                 print(f"District error: {e}")
-                old_val = None  # reset stale marker on error
                 try:
                     safe_js(f"backData('{state['code']}')")
                     time.sleep(1)
