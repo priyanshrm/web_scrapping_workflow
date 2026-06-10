@@ -28,6 +28,7 @@ KEY_FIELDS = ["state", "district_code", "date"]
 # ==============================
 # DRIVER
 # ==============================
+
 options = webdriver.ChromeOptions()
 options.add_argument("--headless")
 options.add_argument("--no-sandbox")
@@ -35,9 +36,6 @@ options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--disable-gpu")
 options.add_argument("--disable-blink-features=AutomationControlled")
 options.add_argument("--start-maximized")
-# options = webdriver.ChromeOptions()
-# options.add_argument("--disable-blink-features=AutomationControlled")
-# options.add_argument("--start-maximized")
 
 driver = webdriver.Chrome(options=options)
 wait = WebDriverWait(driver, 20)
@@ -80,17 +78,18 @@ def ensure_columns(cols):
 
     print(f"[CSV] Added columns: {new_cols}")
 
+
 def fill_missing_sub_columns(row):
     for col in get_fields():
         if col.startswith('-') and col not in row:
             row[col] = "0.0"
+
 
 def upsert_row(new_row):
     ensure_columns(new_row.keys())
     fields = get_fields()
 
     rows = []
-
     if os.path.exists(CSV_FILE):
         with open(CSV_FILE, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -142,7 +141,7 @@ def open_home():
 def change_month(year, month):
     wait.until(EC.element_to_be_clickable((By.ID, "calModal"))).click()
     wait.until(EC.presence_of_element_located((By.ID, "selectedyear")))
-    
+
     driver.execute_script("""
         let y = document.getElementById('selectedyear');
         y.value = arguments[0];
@@ -152,7 +151,7 @@ def change_month(year, month):
     time.sleep(1)
 
     months = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".cal_month a")))
-    driver.execute_script("arguments[0].click();", months[month - 1])  # JS click bypasses interactability
+    driver.execute_script("arguments[0].click();", months[month - 1])
 
     time.sleep(2)
 
@@ -161,6 +160,30 @@ def open_states_modal():
     btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
     btn.click()
     wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
+
+
+# ==============================
+# TABLE HELPERS
+# ==============================
+
+def wait_for_table():
+    """Wait until the Distributed Quantity table is present and has data rows."""
+    WebDriverWait(driver, 15).until(
+        lambda d: any(
+            "Commodity" in [h.text.strip() for h in t.find_elements(By.TAG_NAME, "th")]
+            for t in d.find_elements(By.TAG_NAME, "table")
+        )
+    )
+    time.sleep(1)  # small buffer for full render
+
+
+def get_cell_text(cell):
+    """Get text from a cell, including hidden elements."""
+    text = cell.text.strip()
+    if not text:
+        # fallback for hidden rows in headless
+        text = driver.execute_script("return arguments[0].innerText;", cell).strip()
+    return text
 
 
 # ==============================
@@ -181,29 +204,34 @@ def parse_table() -> dict:
                 if len(cells) < 5:
                     continue
 
-                name_raw = cells[0].text.strip()
+                # Use innerText fallback for hidden rows
+                name_raw = get_cell_text(cells[0])
+
+                # Strip button text if it's a menu-toggle parent row
+                btn = cells[0].find_elements(By.CLASS_NAME, "menu-toggle")
+                if btn:
+                    name_raw = driver.execute_script(
+                        "return arguments[0].innerText;", btn[0]
+                    ).strip()
+
                 if not name_raw or name_raw.lower() == "total":
                     continue
 
-                # Skip the menu-toggle button row (parent "Coarse Grains" activator)
-                # but still capture its value
-                btn = cells[0].find_elements(By.CLASS_NAME, "menu-toggle")
-                if btn:
-                    name_raw = btn[0].text.strip()
-
-                val = cells[4].text.strip()
+                val = get_cell_text(cells[4])
                 row_classes = row.get_attribute("class") or ""
                 is_sub = "customRow" in row_classes
 
                 commodity_data[commodity_to_col(name_raw, is_sub)] = val
 
-            return commodity_data  # found and parsed the right table
+            return commodity_data
 
         except Exception as e:
             print(f"Table parse error: {e}")
 
     print("  [WARN] Could not find Distributed Quantity table")
     return commodity_data
+
+
 # ==============================
 # MAIN
 # ==============================
@@ -272,9 +300,10 @@ try:
                 wait_for_js_function("stateData")
                 safe_js(f"stateData('{d['code']}')")
 
-                time.sleep(2)
+                wait_for_table()  # wait for table to be present before parsing
 
                 commodities = parse_table()
+                print(f"    Columns: {list(commodities.keys())}")  # verify sub-items
 
                 row = {
                     "state": state["name"],
@@ -284,16 +313,17 @@ try:
                     **commodities
                 }
 
-                fill_missing_sub_columns(row)    # ← add this line
-
+                fill_missing_sub_columns(row)
                 upsert_row(row)
 
                 safe_js(f"backData('{state['code']}')")
+                time.sleep(1)
 
             except Exception as e:
                 print(f"District error: {e}")
                 try:
                     safe_js(f"backData('{state['code']}')")
+                    time.sleep(1)
                 except:
                     pass
 
