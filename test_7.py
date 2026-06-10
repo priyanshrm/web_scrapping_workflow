@@ -16,7 +16,7 @@ from selenium.webdriver.support import expected_conditions as EC
 TARGET_YEAR = 2026
 TARGET_MONTH = 4
 START_STATE = 0
-END_STATE = 1
+END_STATE = 2
 
 BASE_URL = "https://impds.nic.in/sale/"
 CSV_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_district_data.csv"
