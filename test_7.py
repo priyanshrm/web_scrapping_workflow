@@ -36,7 +36,7 @@ driver = webdriver.Chrome(options=options)
 wait = WebDriverWait(driver, 20)
 
 # ==============================
-# CSV
+# CSV FUNCTIONS
 # ==============================
 
 def commodity_to_col(name, is_sub):
@@ -115,16 +115,25 @@ def open_states_modal():
     wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
 
 # ==============================
-# JS HELPERS (FAST)
+# CRITICAL FIX (WAIT FOR DISTRICTS)
+# ==============================
+
+def wait_for_districts():
+    WebDriverWait(driver, 20).until(
+        lambda d: len(d.execute_script("""
+            return document.querySelectorAll('a[onclick*="DistrictData"]').length;
+        """)) > 0
+    )
+
+# ==============================
+# JS HELPERS
 # ==============================
 
 GET_STATES_JS = """
 var result = [];
 document.querySelectorAll('#myModal11 a').forEach(a => {
     var m = a.getAttribute("onclick")?.match(/stateData\\('(\\d+)'\\)/);
-    if (m) {
-        result.push({name: a.innerText.trim(), code: m[1]});
-    }
+    if (m) result.push({name: a.innerText.trim(), code: m[1]});
 });
 return result;
 """
@@ -148,9 +157,7 @@ var result = [];
 var t = document.querySelector('table[aria-label*="Distributed Quantity"]');
 if (!t) return [];
 
-var rows = t.querySelectorAll('tr');
-
-rows.forEach(r => {
+t.querySelectorAll('tr').forEach(r => {
     var td = r.querySelectorAll('td');
     if (td.length < 5) return;
 
@@ -166,26 +173,21 @@ return result;
 """
 
 # ==============================
-# WAIT
+# WAIT DISTRICT PAGE
 # ==============================
 
 def wait_for_district(name):
     target = name.upper().strip()
-
-    def check(d):
-        try:
-            return d.execute_script("""
-                var els = document.querySelectorAll('[key="district"]');
-                for (var e of els) {
-                    var t = e.innerText.replace(/\\s+/g,' ').trim().toUpperCase();
-                    if (t.includes(arguments[0])) return true;
-                }
-                return false;
-            """, target)
-        except:
-            return False
-
-    WebDriverWait(driver, 15).until(check)
+    WebDriverWait(driver, 15).until(
+        lambda d: d.execute_script("""
+            var els = document.querySelectorAll('[key="district"]');
+            for (var e of els) {
+                var t = e.innerText.replace(/\\s+/g,' ').trim().toUpperCase();
+                if (t.includes(arguments[0])) return true;
+            }
+            return false;
+        """, target)
+    )
 
 # ==============================
 # MAIN
@@ -203,12 +205,13 @@ try:
 
         print(f"\nSTATE: {state['name']}")
 
-        # fresh load every state
         open_home()
         open_states_modal()
 
         driver.execute_script(f"stateData('{state['code']}')")
-        time.sleep(2)
+
+        # 🔥 FIX: wait for districts properly
+        wait_for_districts()
 
         districts = driver.execute_script(GET_DISTRICTS_JS)
         print(f"Districts: {len(districts)}")
@@ -217,7 +220,6 @@ try:
             try:
                 print(f"  -> {d['name']} ({d['code']})")
 
-                # correct call
                 driver.execute_script(f"DistrictData('{d['code']}')")
 
                 wait_for_district(d["name"])
@@ -229,8 +231,6 @@ try:
                     col = commodity_to_col(r["name"], r["isSub"])
                     commodities[col] = r["val"]
 
-                print(f"    Columns: {list(commodities.keys())}")
-
                 row = {
                     "state": state["name"],
                     "district": d["name"],
@@ -241,14 +241,13 @@ try:
 
                 upsert_row(row)
 
-                # reload state (NO backData)
                 driver.execute_script(f"stateData('{state['code']}')")
-                time.sleep(1)
+                wait_for_districts()
 
             except Exception as e:
                 print(f"  ERROR: {d['name']} -> {e}")
                 driver.execute_script(f"stateData('{state['code']}')")
-                time.sleep(1)
+                wait_for_districts()
 
 finally:
     print(f"\nDONE → {CSV_FILE}")
