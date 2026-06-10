@@ -19,6 +19,9 @@ END_STATE = 1
 BASE_URL = "https://impds.nic.in/sale/"
 CSV_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_district_data.csv"
 
+DEBUG_DIR = "debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
 KEY_FIELDS = ["state", "district_code", "date"]
 
@@ -33,6 +36,21 @@ options.add_argument("--disable-dev-shm-usage")
 
 driver = webdriver.Chrome(options=options)
 wait = WebDriverWait(driver, 20)
+
+# ==============================
+# DEBUG HELPERS
+# ==============================
+
+def save_debug(name):
+    ts = int(time.time())
+    png = f"{DEBUG_DIR}/{name}_{ts}.png"
+    html = f"{DEBUG_DIR}/{name}_{ts}.html"
+
+    driver.save_screenshot(png)
+    with open(html, "w", encoding="utf-8") as f:
+        f.write(driver.page_source)
+
+    print(f"[DEBUG] Saved: {png}, {html}")
 
 # ==============================
 # CSV FUNCTIONS
@@ -114,7 +132,7 @@ def open_states_modal():
     wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
 
 # ==============================
-# FIXED WAIT FOR DISTRICTS
+# WAIT SYSTEM
 # ==============================
 
 def wait_for_districts():
@@ -124,14 +142,28 @@ def wait_for_districts():
         """) > 0
     )
 
-# retry wrapper (important for GitHub)
+def wait_for_district(name):
+    target = name.upper().strip()
+    WebDriverWait(driver, 15).until(
+        lambda d: d.execute_script("""
+            var els = document.querySelectorAll('[key="district"]');
+            for (var e of els) {
+                var t = e.innerText.replace(/\\s+/g,' ').trim().toUpperCase();
+                if (t.includes(arguments[0])) return true;
+            }
+            return false;
+        """, target)
+    )
+
 def load_state_with_retry(code, retries=3):
     for i in range(retries):
+        print(f"[Retry {i+1}] Loading state {code}")
         driver.execute_script(f"stateData('{code}')")
         try:
             wait_for_districts()
             return True
         except:
+            save_debug(f"state_fail_{code}")
             time.sleep(2)
     return False
 
@@ -182,19 +214,6 @@ t.querySelectorAll('tr').forEach(r => {
 return result;
 """
 
-def wait_for_district(name):
-    target = name.upper().strip()
-    WebDriverWait(driver, 15).until(
-        lambda d: d.execute_script("""
-            var els = document.querySelectorAll('[key="district"]');
-            for (var e of els) {
-                var t = e.innerText.replace(/\\s+/g,' ').trim().toUpperCase();
-                if (t.includes(arguments[0])) return true;
-            }
-            return false;
-        """, target)
-    )
-
 # ==============================
 # MAIN
 # ==============================
@@ -216,11 +235,15 @@ try:
         time.sleep(1)
 
         if not load_state_with_retry(state["code"]):
-            print("Failed to load districts, skipping state")
+            print("❌ Failed to load state")
             continue
 
         districts = driver.execute_script(GET_DISTRICTS_JS)
         print(f"Districts: {len(districts)}")
+
+        if len(districts) == 0:
+            save_debug("no_districts")
+            continue
 
         for d in districts:
             try:
@@ -230,6 +253,9 @@ try:
                 wait_for_district(d["name"])
 
                 rows = driver.execute_script(PARSE_TABLE_JS)
+
+                if not rows:
+                    save_debug(f"no_table_{d['code']}")
 
                 commodities = {}
                 for r in rows:
@@ -249,7 +275,8 @@ try:
                 load_state_with_retry(state["code"])
 
             except Exception as e:
-                print(f"  ERROR: {d['name']} -> {e}")
+                print(f"❌ ERROR: {d['name']} -> {e}")
+                save_debug(f"district_fail_{d['code']}")
                 load_state_with_retry(state["code"])
 
 finally:
