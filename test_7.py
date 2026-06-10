@@ -151,25 +151,15 @@ def open_states_modal():
 
 
 # ==============================
-# WAIT FOR CORRECT DISTRICT PAGE
+# WAIT HELPERS
 # ==============================
 
 def wait_for_district_page(district_name, timeout=15):
-    """
-    Wait until the page is showing the specific district's data.
-
-    The district page has a breadcrumb element:
-        <div class="status m_menu" key="district">SOUTH ANDAMANS</div>
-
-    The national/state page does NOT have this element with the district name.
-    This is the reliable signal that the correct district data is loaded.
-    """
+    """Wait until the district breadcrumb confirms this district is loaded."""
     district_upper = district_name.strip().upper()
 
     def correct_district_loaded(d):
         try:
-            # Look for the district breadcrumb div that shows the district name.
-            # On the district page: <div class="status m_menu" key="district">DISTRICT NAME</div>
             result = d.execute_script("""
                 var els = document.querySelectorAll('[key="district"]');
                 for (var i = 0; i < els.length; i++) {
@@ -183,27 +173,111 @@ def wait_for_district_page(district_name, timeout=15):
             return False
 
     WebDriverWait(driver, timeout).until(correct_district_loaded)
-    time.sleep(0.5)  # small buffer for table to fully render
+    time.sleep(0.5)
+
+
+def wait_for_state_page(timeout=10):
+    """Wait until district breadcrumb is cleared (back to state view)."""
+    def state_view_loaded(d):
+        try:
+            return d.execute_script("""
+                var els = document.querySelectorAll('[key="district"]');
+                for (var i = 0; i < els.length; i++) {
+                    if (els[i].innerText.trim() !== '') return false;
+                }
+                var stEls = document.querySelectorAll('[key="state"]');
+                for (var i = 0; i < stEls.length; i++) {
+                    if (stEls[i].innerText.trim() !== '') return true;
+                }
+                return false;
+            """)
+        except Exception:
+            return False
+
+    WebDriverWait(driver, timeout).until(state_view_loaded)
+    time.sleep(0.3)
 
 
 # ==============================
-# TABLE PARSER — pure JS, no Selenium element refs
+# DISTRICT NAVIGATION
 # ==============================
 
-# Extracts all commodity rows from the Distributed Quantity table via JS.
-# Specifically targets the table with aria-label="Distributed Quantity(In MT)"
-# to avoid accidentally parsing the national-level table.
+def navigate_to_district(district_code, district_name, state_code, retries=3):
+    """Navigate to a district using DistrictData() JS call with retry logic."""
+    for attempt in range(retries):
+        try:
+            if attempt > 0:
+                print(f"    [RETRY {attempt}] {district_name}")
+                try:
+                    safe_js(f"backData('{state_code}')")
+                    time.sleep(2)
+                except Exception:
+                    pass
+
+            wait_for_js_function("DistrictData")
+            safe_js(f"DistrictData('{district_code}')")
+            wait_for_district_page(district_name, timeout=15)
+            return True
+
+        except Exception as e:
+            print(f"    [WARN] Attempt {attempt+1} failed for {district_name}: {e}")
+            time.sleep(2)
+
+    return False
+
+
+def back_to_state(state_code, timeout=10):
+    """Go back to state view and confirm district breadcrumb is cleared."""
+    safe_js(f"backData('{state_code}')")
+    wait_for_state_page(timeout=timeout)
+
+
+# ==============================
+# COLLECT DISTRICTS FROM MAP DOTS
+# ==============================
+
+def collect_districts():
+    """
+    Collect districts from the blinking map dot links.
+    The HTML uses: <a onclick="DistrictData('638')"><img aria-label="NICOBARS" ...></a>
+    This is the correct and complete source for all districts.
+    """
+    districts = []
+    seen = set()
+
+    imgs = driver.find_elements(By.CSS_SELECTOR, "img.map[aria-label]")
+    for img in imgs:
+        try:
+            parent_a = img.find_element(By.XPATH, "..")
+            onclick = parent_a.get_attribute("onclick") or ""
+            match = re.search(r"DistrictData\('(\d+)'\)", onclick)
+            if not match:
+                continue
+            code = match.group(1)
+            name = (img.get_attribute("aria-label") or
+                    img.get_attribute("title") or "").strip()
+            if code and name and code not in seen:
+                districts.append({"name": name, "code": code})
+                seen.add(code)
+        except Exception:
+            continue
+
+    return districts
+
+
+# ==============================
+# TABLE PARSER
+# ==============================
+
 PARSE_TABLE_JS = """
     var result = [];
     var tables = document.querySelectorAll('table');
     for (var t of tables) {
-        // Identify the right table by aria-label (most reliable)
         var ariaLabel = t.getAttribute('aria-label') || '';
         var ths = Array.from(t.querySelectorAll('th')).map(function(h){ return h.innerText.trim(); });
         if (ariaLabel.indexOf('Distributed Quantity') === -1 &&
             (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1)) continue;
 
-        // Skip tables inside #stateDefaultDivId (national view)
         var inDefault = false;
         var parent = t.parentElement;
         while (parent) {
@@ -221,7 +295,6 @@ PARSE_TABLE_JS = """
             var nameCell = cells[0];
             var name = nameCell.innerText.trim();
 
-            // menu-toggle parent row (e.g. Coarse Grains)
             var btn = nameCell.querySelector('.menu-toggle');
             if (btn) {
                 name = btn.innerText.trim();
@@ -234,14 +307,13 @@ PARSE_TABLE_JS = """
 
             result.push({name: name, val: val, isSub: isSub});
         }
-        return result;  // found and parsed the right table
+        return result;
     }
     return result;
 """
 
 
-def parse_table() -> dict:
-    """Extract all commodity data from the district Distributed Quantity table via JS."""
+def parse_table():
     try:
         rows = driver.execute_script(PARSE_TABLE_JS)
     except Exception as e:
@@ -269,6 +341,7 @@ try:
     change_month(TARGET_YEAR, TARGET_MONTH)
     open_states_modal()
 
+    # Collect all states
     states = []
     links = driver.find_elements(By.CSS_SELECTOR, "#myModal11 a")
     for l in links:
@@ -283,13 +356,12 @@ try:
     print(f"States found: {len(states)}")
 
     for state in states[START_STATE:END_STATE]:
-
         print(f"\nSTATE: {state['name']}")
 
         open_home()
         open_states_modal()
 
-        # click state
+        # Click into the state
         for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
             if state["code"] in (l.get_attribute("onclick") or ""):
                 l.click()
@@ -299,35 +371,27 @@ try:
         safe_js(f"liveDistrictdata('{state['code']}')")
         time.sleep(2)
 
-        # collect districts
-        districts = []
-        for l in driver.find_elements(By.TAG_NAME, "a"):
-            onclick = l.get_attribute("onclick")
-            if onclick and "stateData(" in onclick:
-                match = re.search(r"stateData\('(\d+)'\)", onclick)
-                if match:
-                    imgs = l.find_elements(By.TAG_NAME, "img")
-                    if imgs and imgs[0].get_attribute("width") == "12":
-                        districts.append({
-                            "name": imgs[0].get_attribute("aria-label"),
-                            "code": match.group(1)
-                        })
-
-        # dedupe
-        seen = set()
-        districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
+        # Collect districts from map dots using DistrictData()
+        districts = collect_districts()
         print(f"Districts: {len(districts)}")
 
+        if not districts:
+            print(f"  [WARN] No districts found for {state['name']}, skipping.")
+            continue
+
         for d in districts:
+            print(f"  -> {d['name']} (code: {d['code']})")
+
+            success = navigate_to_district(d["code"], d["name"], state["code"])
+            if not success:
+                print(f"  [SKIP] {d['name']} — failed after retries")
+                try:
+                    back_to_state(state["code"])
+                except Exception:
+                    pass
+                continue
+
             try:
-                print(f"  -> {d['name']} (code: {d['code']})")
-
-                wait_for_js_function("stateData")
-                safe_js(f"stateData('{d['code']}')")
-
-                # Wait until the page breadcrumb confirms this specific district is loaded
-                wait_for_district_page(d["name"])
-
                 commodities = parse_table()
                 print(f"    Columns: {list(commodities.keys())}")
                 print(f"    Values:  {commodities}")
@@ -343,16 +407,14 @@ try:
                 fill_missing_sub_columns(row)
                 upsert_row(row)
 
-                safe_js(f"backData('{state['code']}')")
-                time.sleep(1)
-
             except Exception as e:
-                print(f"  District error ({d['name']}): {e}")
-                try:
-                    safe_js(f"backData('{state['code']}')")
-                    time.sleep(1)
-                except Exception:
-                    pass
+                print(f"  [ERROR] Parsing/saving {d['name']}: {e}")
+
+            try:
+                back_to_state(state["code"])
+            except Exception as e:
+                print(f"  [WARN] backData failed after {d['name']}: {e}")
+                time.sleep(1)
 
 except Exception:
     import traceback
