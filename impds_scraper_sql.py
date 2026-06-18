@@ -162,10 +162,27 @@ def change_month(year, month):
     time.sleep(2)
 
 
-def open_states_modal():
-    btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
-    btn.click()
-    wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
+def open_states_modal(retries=3):
+    """Click the states button and wait for the modal, with retries."""
+    for attempt in range(retries):
+        try:
+            # Wait for page JS to be ready before interacting
+            WebDriverWait(driver, 20).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(1)  # extra buffer for Angular binding
+
+            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
+            driver.execute_script("arguments[0].click();", btn)  # JS click avoids intercept issues
+            wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
+            return  # success
+        except Exception as e:
+            print(f"  [WARN] open_states_modal attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                driver.refresh()
+                time.sleep(3)
+            else:
+                raise
 
 
 # ==============================
@@ -257,15 +274,10 @@ PARSE_TABLE_JS = """
 
 
 def parse_table() -> dict:
-    try:
-        rows = driver.execute_script(PARSE_TABLE_JS)
-    except Exception as e:
-        print(f"  [WARN] parse_table JS error: {e}")
-        return {}
+    rows = driver.execute_script(PARSE_TABLE_JS)
 
     if not rows:
-        print("  [WARN] Could not find Distributed Quantity table")
-        return {}
+        raise ValueError("Distributed Quantity table found but returned no commodity rows")
 
     commodity_data = {}
     for r in rows:
@@ -338,10 +350,16 @@ try:
 
                 wait_for_js_function("stateData")
                 safe_js(f"stateData('{d['code']}')")
-
                 wait_for_district_page(d["name"])
 
-                commodities = parse_table()
+                # Table is always present — retry once if DOM isn't ready yet
+                try:
+                    commodities = parse_table()
+                except ValueError:
+                    print(f"    [RETRY] Table empty on first attempt, waiting 2s...")
+                    time.sleep(2)
+                    commodities = parse_table()  # raises again if still empty → caught below
+
                 print(f"    Columns: {list(commodities.keys())}")
                 print(f"    Values:  {commodities}")
 
