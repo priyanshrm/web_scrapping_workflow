@@ -30,12 +30,12 @@ jobs:
         run: pip install selenium
 
       - name: Run Scraper
-        run: python impds_scraper_sql.py   # ← rename if you changed the filename
+        run: python test_7.py
 
-      - name: Commit and push DB
+      - name: Commit and push CSV
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
-          git add *.db || echo "No DB generated"   # ← was *.csv
+          git add *.csv || echo "No CSV generated"
           git commit -m "Auto-updated scraped district data [Skip CI]" || exit 0
           git push
