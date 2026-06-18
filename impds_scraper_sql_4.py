@@ -12,25 +12,19 @@ from selenium.webdriver.support import expected_conditions as EC
 # ==============================
 # CONFIG
 # ==============================
-import argparse
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--start", type=int, default=0)
-parser.add_argument("--end", type=int, default=None)
-parser.add_argument("--year", type=int, default=2023)
-parser.add_argument("--month", type=int, default=4)
-args = parser.parse_args()
-
-TARGET_YEAR = args.year
-TARGET_MONTH = args.month
-START_STATE = args.start
-END_STATE = args.end if args.end != 99 else None
+TARGET_YEAR = 2023
+TARGET_MONTH = 4
+START_STATE = 0
+END_STATE = None
 
 BASE_URL = "https://impds.nic.in/sale/"
-DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}.db"
+DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_district_data.db"
 
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
 KEY_FIELDS = ["state", "district_code", "date"]
+
+
 # ==============================
 # DRIVER
 # ==============================
