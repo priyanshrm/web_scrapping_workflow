@@ -13,10 +13,10 @@ from selenium.webdriver.support import expected_conditions as EC
 # CONFIG
 # ==============================
 
-TARGET_YEAR = 2026
+TARGET_YEAR = 2023
 TARGET_MONTH = 4
 START_STATE = 0
-END_STATE = 2
+END_STATE = None
 
 BASE_URL = "https://impds.nic.in/sale/"
 DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_district_data.db"

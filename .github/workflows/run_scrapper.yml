@@ -30,7 +30,7 @@ jobs:
         run: pip install selenium
 
       - name: Run Scraper
-        run: python impds_scraper_sql.py   # ← rename if you changed the filename
+        run: python impds_scraper_sql_3.py   # ← rename if you changed the filename
 
       - name: Commit and push DB
         run: |
