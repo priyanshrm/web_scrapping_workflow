@@ -1,7 +1,7 @@
 import re
 import time
-import os
 import sqlite3
+import os
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -20,9 +20,10 @@ END_STATE = 2
 
 BASE_URL = "https://impds.nic.in/sale/"
 DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_district_data.db"
+TABLE_NAME = "district_data"
 
-FIXED_FIELDS = ["state", "district", "district_code", "date"]
 KEY_FIELDS = ["state", "district_code", "date"]
+FIXED_FIELDS = ["state", "district", "district_code", "date"]
 
 
 # ==============================
@@ -42,83 +43,81 @@ wait = WebDriverWait(driver, 20)
 
 
 # ==============================
-# SQL HELPERS
+# DB HELPERS
 # ==============================
 
-def get_connection():
-    return sqlite3.connect(DB_FILE)
+def get_db():
+    """Return a connection with WAL mode for faster concurrent writes."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def commodity_to_col(name, is_sub):
+    col = name.strip().lower().replace(" ", "_")
+    # SQLite column names can't start with '-'; prefix sub-commodities with 'sub_'
+    return f"sub_{col}" if is_sub else col
 
 
 def init_db():
     """Create the table with fixed columns if it doesn't exist."""
-    with get_connection() as con:
-        cols_def = ", ".join(
-            f'"{c}" TEXT' if c != "district_code" else f'"{c}" TEXT'
-            for c in FIXED_FIELDS
-        )
-        con.execute(f"""
-            CREATE TABLE IF NOT EXISTS district_data (
-                {cols_def},
-                PRIMARY KEY ({', '.join(f'"{k}"' for k in KEY_FIELDS)})
+    with get_db() as conn:
+        cols_ddl = ", ".join(f'"{c}" TEXT' for c in FIXED_FIELDS)
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                {cols_ddl},
+                UNIQUE({", ".join(f'"{k}"' for k in KEY_FIELDS)})
             )
         """)
-        con.commit()
+        # Index on key fields for fast upsert lookup
+        conn.execute(f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_key
+            ON {TABLE_NAME} ({", ".join(f'"{k}"' for k in KEY_FIELDS)})
+        """)
+    print(f"[DB] Initialised → {DB_FILE}")
 
 
 def get_existing_columns():
-    """Return the current column names in the table."""
-    with get_connection() as con:
-        cur = con.execute("PRAGMA table_info(district_data)")
-        return [row[1] for row in cur.fetchall()]
+    """Return the set of column names currently in the table."""
+    with get_db() as conn:
+        cur = conn.execute(f"PRAGMA table_info({TABLE_NAME})")
+        return {row["name"] for row in cur.fetchall()}
 
 
-def ensure_columns(col_names):
-    """Add any new commodity columns that don't exist yet."""
-    existing = set(get_existing_columns())
+def ensure_columns(col_names: list[str]):
+    """
+    Add any new commodity columns that aren't in the table yet.
+    ALTER TABLE ADD COLUMN is a metadata-only op in SQLite — very fast.
+    """
+    existing = get_existing_columns()
     new_cols = [c for c in col_names if c not in existing]
     if not new_cols:
         return
-    with get_connection() as con:
+    with get_db() as conn:
         for col in new_cols:
-            con.execute(f'ALTER TABLE district_data ADD COLUMN "{col}" TEXT DEFAULT "0.0"')
-        con.commit()
-    print(f"  [DB] New columns added: {new_cols}")
+            conn.execute(f'ALTER TABLE {TABLE_NAME} ADD COLUMN "{col}" TEXT DEFAULT "0.0"')
+    print(f"[DB] Added columns: {new_cols}")
 
 
-def fill_missing_sub_columns(row):
-    """Fill sub-commodity columns that are absent in this row with '0.0'."""
-    existing = get_existing_columns()
-    for col in existing:
-        if col.startswith('-') and col not in row:
-            row[col] = "0.0"
-
-
-def upsert_row(new_row):
+def upsert_row(row: dict):
     """
-    Ensure all columns exist, then INSERT OR REPLACE the row.
-    SQLite's PRIMARY KEY constraint handles the upsert: if the composite key
-    (state, district_code, date) already exists, the row is replaced in full.
+    Insert or update a district row.
+    Uses INSERT OR REPLACE which leverages the UNIQUE index — no full table scan.
     """
-    ensure_columns(new_row.keys())
-    all_cols = get_existing_columns()
+    ensure_columns([c for c in row if c not in FIXED_FIELDS])
 
-    # Build the full row dict, filling any missing columns with empty string
-    full_row = {col: new_row.get(col, "") for col in all_cols}
+    cols = list(row.keys())
+    placeholders = ", ".join("?" for _ in cols)
+    col_clause = ", ".join(f'"{c}"' for c in cols)
+    values = [row[c] for c in cols]
 
-    cols_sql = ", ".join(f'"{c}"' for c in all_cols)
-    placeholders = ", ".join("?" for _ in all_cols)
-    values = [full_row[c] for c in all_cols]
-
-    with get_connection() as con:
-        con.execute(
-            f'INSERT OR REPLACE INTO district_data ({cols_sql}) VALUES ({placeholders})',
-            values
+    with get_db() as conn:
+        conn.execute(
+            f"INSERT OR REPLACE INTO {TABLE_NAME} ({col_clause}) VALUES ({placeholders})",
+            values,
         )
-        con.commit()
-
-
-# Initialize DB on startup
-init_db()
 
 
 # ==============================
@@ -163,10 +162,27 @@ def change_month(year, month):
     time.sleep(2)
 
 
-def open_states_modal():
-    btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
-    btn.click()
-    wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
+def open_states_modal(retries=3):
+    """Click the states button and wait for the modal, with retries."""
+    for attempt in range(retries):
+        try:
+            # Wait for page JS to be ready before interacting
+            WebDriverWait(driver, 20).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(1)  # extra buffer for Angular binding
+
+            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
+            driver.execute_script("arguments[0].click();", btn)  # JS click avoids intercept issues
+            wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
+            return  # success
+        except Exception as e:
+            print(f"  [WARN] open_states_modal attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                driver.refresh()
+                time.sleep(3)
+            else:
+                raise
 
 
 # ==============================
@@ -174,13 +190,6 @@ def open_states_modal():
 # ==============================
 
 def wait_for_district_page(district_name, timeout=15):
-    """
-    Wait until the page breadcrumb confirms this specific district is loaded.
-    The district page has:  <div class="status m_menu" key="district">SOUTH ANDAMANS</div>
-    This element MUST be found — the caller should never proceed without it.
-    Raises TimeoutException if not found within timeout, which the caller must handle
-    as a hard retry/abort (not silently skip).
-    """
     district_upper = district_name.strip().upper()
 
     def correct_district_loaded(d):
@@ -198,7 +207,7 @@ def wait_for_district_page(district_name, timeout=15):
             return False
 
     WebDriverWait(driver, timeout).until(correct_district_loaded)
-    time.sleep(0.5)  # small buffer for table to fully render
+    time.sleep(0.5)
 
 
 # ==============================
@@ -206,10 +215,6 @@ def wait_for_district_page(district_name, timeout=15):
 # ==============================
 
 def wait_for_state_page(timeout=15):
-    """
-    Wait until the district breadcrumb is removed or cleared,
-    signaling that the page has successfully returned to the state view.
-    """
     def state_page_loaded(d):
         return d.execute_script("""
             var els = document.querySelectorAll('[key="district"]');
@@ -221,7 +226,7 @@ def wait_for_state_page(timeout=15):
 
 
 # ==============================
-# TABLE PARSER — pure JS, no Selenium element refs
+# TABLE PARSER
 # ==============================
 
 PARSE_TABLE_JS = """
@@ -268,22 +273,11 @@ PARSE_TABLE_JS = """
 """
 
 
-def commodity_to_col(name, is_sub):
-    col = name.strip().lower().replace(" ", "_")
-    return f"-{col}" if is_sub else col
-
-
 def parse_table() -> dict:
-    """Extract all commodity data from the district Distributed Quantity table via JS."""
-    try:
-        rows = driver.execute_script(PARSE_TABLE_JS)
-    except Exception as e:
-        pass  # JS parse error; retry will handle
-        return {}
+    rows = driver.execute_script(PARSE_TABLE_JS)
 
     if not rows:
-        pass  # table not found; retry will handle
-        return {}
+        raise ValueError("Distributed Quantity table found but returned no commodity rows")
 
     commodity_data = {}
     for r in rows:
@@ -294,68 +288,10 @@ def parse_table() -> dict:
 
 
 # ==============================
-# DISTRICT SCRAPER WITH MANDATORY ELEMENT ENFORCEMENT
-# ==============================
-
-MAX_DISTRICT_RETRIES = 3
-
-
-def scrape_district(d, state):
-    """
-    Scrape a single district. Retries up to MAX_DISTRICT_RETRIES times if the
-    district breadcrumb element ([key="district"]) is not found.
-    Raises after exhausting retries — the caller must handle (log + move on to
-    next district, NOT silently skip).
-    """
-    last_exc = None
-
-    for attempt in range(1, MAX_DISTRICT_RETRIES + 1):
-        try:
-            print(f"  [{attempt}/{MAX_DISTRICT_RETRIES}] Scraping: {d['name']}")
-
-            wait_for_js_function("stateData")
-            safe_js(f"stateData('{d['code']}')")
-
-            # This is the mandatory guard — must confirm the correct district page
-            # is rendered before reading any data. TimeoutException here triggers retry.
-            wait_for_district_page(d["name"])
-
-            commodities = parse_table()
-
-            row = {
-                "state": state["name"],
-                "district": d["name"],
-                "district_code": d["code"],
-                "date": f"{TARGET_YEAR}-{TARGET_MONTH:02d}",
-                **commodities
-            }
-
-            fill_missing_sub_columns(row)
-            upsert_row(row)
-            print(f"  [OK] {d['name']} — inserted")
-            return  # success
-
-        except Exception as e:
-            last_exc = e
-            print(f"  [RETRY {attempt}/{MAX_DISTRICT_RETRIES}] {d['name']} — {type(e).__name__}")
-            # Navigate back to state view before retrying
-            try:
-                safe_js(f"backData('{state['code']}')")
-                wait_for_state_page()
-            except Exception:
-                pass
-            time.sleep(1)
-
-    # All retries exhausted — raise so caller can log and continue to next district
-    raise RuntimeError(
-        f"District '{d['name']}' (code: {d['code']}) failed after "
-        f"{MAX_DISTRICT_RETRIES} attempts. Last error: {last_exc}"
-    )
-
-
-# ==============================
 # MAIN
 # ==============================
+
+init_db()
 
 try:
     open_home()
@@ -373,16 +309,15 @@ try:
                 "code": match.group(1)
             })
 
-    print(f"[INFO] {len(states)} states found — processing [{START_STATE}:{END_STATE}]")
+    print(f"States found: {len(states)}")
 
     for state in states[START_STATE:END_STATE]:
 
-        print(f"\n{'='*50}\n[STATE] {state['name']}")
+        print(f"\nSTATE: {state['name']}")
 
         open_home()
         open_states_modal()
 
-        # click state
         for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
             if state["code"] in (l.get_attribute("onclick") or ""):
                 l.click()
@@ -392,7 +327,6 @@ try:
         safe_js(f"liveDistrictdata('{state['code']}')")
         time.sleep(2)
 
-        # collect districts
         districts = []
         for l in driver.find_elements(By.TAG_NAME, "a"):
             onclick = l.get_attribute("onclick")
@@ -406,19 +340,44 @@ try:
                             "code": match.group(1)
                         })
 
-        # dedupe
         seen = set()
         districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
-        print(f"[INFO] {len(districts)} districts found")
+        print(f"Districts: {len(districts)}")
 
         for d in districts:
             try:
-                scrape_district(d, state)
-            except RuntimeError as e:
-                # District exhausted all retries — log it and continue to the next one
-                print(f"  [FAILED] {d['name']} — exhausted {MAX_DISTRICT_RETRIES} retries")
-            finally:
-                # Always navigate back to state view before next district
+                print(f"  -> {d['name']} (code: {d['code']})")
+
+                wait_for_js_function("stateData")
+                safe_js(f"stateData('{d['code']}')")
+                wait_for_district_page(d["name"])
+
+                # Table is always present — retry once if DOM isn't ready yet
+                try:
+                    commodities = parse_table()
+                except ValueError:
+                    print(f"    [RETRY] Table empty on first attempt, waiting 2s...")
+                    time.sleep(2)
+                    commodities = parse_table()  # raises again if still empty → caught below
+
+                print(f"    Columns: {list(commodities.keys())}")
+                print(f"    Values:  {commodities}")
+
+                row = {
+                    "state": state["name"],
+                    "district": d["name"],
+                    "district_code": d["code"],
+                    "date": f"{TARGET_YEAR}-{TARGET_MONTH:02d}",
+                    **commodities,
+                }
+
+                upsert_row(row)
+
+                safe_js(f"backData('{state['code']}')")
+                wait_for_state_page()
+
+            except Exception as e:
+                print(f"  District error ({d['name']}): {e}")
                 try:
                     safe_js(f"backData('{state['code']}')")
                     wait_for_state_page()
@@ -430,5 +389,5 @@ except Exception:
     traceback.print_exc()
 
 finally:
-    print(f"\n{'='*50}\n[DONE] Data saved to {DB_FILE}")
+    print(f"\nDONE → {DB_FILE}")
     driver.quit()
