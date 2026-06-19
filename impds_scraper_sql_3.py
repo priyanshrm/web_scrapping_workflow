@@ -1,7 +1,8 @@
 import re
 import time
-import os
+import signal
 import sqlite3
+import argparse
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -12,39 +13,60 @@ from selenium.webdriver.support import expected_conditions as EC
 # ==============================
 # CONFIG
 # ==============================
-import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--start", type=int, default=0)
-parser.add_argument("--end", type=int, default=None)
-parser.add_argument("--year", type=int, default=2023)
+parser.add_argument("--end",   type=int, default=None)
+parser.add_argument("--year",  type=int, default=2023)
 parser.add_argument("--month", type=int, default=4)
 args = parser.parse_args()
 
-TARGET_YEAR = args.year
+TARGET_YEAR  = args.year
 TARGET_MONTH = args.month
-START_STATE = args.start
-END_STATE = args.end if args.end != 99 else None
+START_STATE  = args.start
+END_STATE    = args.end if (args.end is None or args.end != 99) else None
 
 BASE_URL = "https://impds.nic.in/sale/"
-DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}.db"
+DB_FILE  = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}.db"
 
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
-KEY_FIELDS = ["state", "district_code", "date"]
+KEY_FIELDS   = ["state", "district_code", "date"]
+
+# The Distributed Quantity table is GUARANTEED on every district page.
+# Loop forever until extracted. Relaunch browser every N failures.
+TABLE_WAIT_TIMEOUT    = 20    # seconds to wait for table per attempt
+DISTRICT_HARD_TIMEOUT = 180   # 3 min hard ceiling per attempt (kills hung waits)
+ATTEMPTS_BEFORE_RELAUNCH = 3  # relaunch browser after every 3 consecutive failures
+
+
 # ==============================
-# DRIVER
+# CHROME OPTIONS (reused on relaunch)
 # ==============================
 
-options = webdriver.ChromeOptions()
-options.add_argument("--headless")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--disable-gpu")
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--start-maximized")
+def make_chrome_options():
+    opts = webdriver.ChromeOptions()
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--start-maximized")
+    return opts
 
-driver = webdriver.Chrome(options=options)
-wait = WebDriverWait(driver, 20)
+
+driver = webdriver.Chrome(options=make_chrome_options())
+wait   = WebDriverWait(driver, 20)
+
+
+# ==============================
+# HARD TIMEOUT MACHINERY
+# ==============================
+
+class DistrictTimeout(Exception):
+    pass
+
+def _timeout_handler(signum, frame):
+    raise DistrictTimeout("Hard timeout exceeded")
 
 
 # ==============================
@@ -56,12 +78,8 @@ def get_connection():
 
 
 def init_db():
-    """Create the table with fixed columns if it doesn't exist."""
     with get_connection() as con:
-        cols_def = ", ".join(
-            f'"{c}" TEXT' if c != "district_code" else f'"{c}" TEXT'
-            for c in FIXED_FIELDS
-        )
+        cols_def = ", ".join(f'"{c}" TEXT' for c in FIXED_FIELDS)
         con.execute(f"""
             CREATE TABLE IF NOT EXISTS district_data (
                 {cols_def},
@@ -72,16 +90,14 @@ def init_db():
 
 
 def get_existing_columns():
-    """Return the current column names in the table."""
     with get_connection() as con:
         cur = con.execute("PRAGMA table_info(district_data)")
         return [row[1] for row in cur.fetchall()]
 
 
 def ensure_columns(col_names):
-    """Add any new commodity columns that don't exist yet."""
     existing = set(get_existing_columns())
-    new_cols = [c for c in col_names if c not in existing]
+    new_cols  = [c for c in col_names if c not in existing]
     if not new_cols:
         return
     with get_connection() as con:
@@ -92,7 +108,6 @@ def ensure_columns(col_names):
 
 
 def fill_missing_sub_columns(row):
-    """Fill sub-commodity columns that are absent in this row with '0.0'."""
     existing = get_existing_columns()
     for col in existing:
         if col.startswith('-') and col not in row:
@@ -100,21 +115,12 @@ def fill_missing_sub_columns(row):
 
 
 def upsert_row(new_row):
-    """
-    Ensure all columns exist, then INSERT OR REPLACE the row.
-    SQLite's PRIMARY KEY constraint handles the upsert: if the composite key
-    (state, district_code, date) already exists, the row is replaced in full.
-    """
     ensure_columns(new_row.keys())
-    all_cols = get_existing_columns()
-
-    # Build the full row dict, filling any missing columns with empty string
-    full_row = {col: new_row.get(col, "") for col in all_cols}
-
-    cols_sql = ", ".join(f'"{c}"' for c in all_cols)
+    all_cols     = get_existing_columns()
+    full_row     = {col: new_row.get(col, "") for col in all_cols}
+    cols_sql     = ", ".join(f'"{c}"' for c in all_cols)
     placeholders = ", ".join("?" for _ in all_cols)
-    values = [full_row[c] for c in all_cols]
-
+    values       = [full_row[c] for c in all_cols]
     with get_connection() as con:
         con.execute(
             f'INSERT OR REPLACE INTO district_data ({cols_sql}) VALUES ({placeholders})',
@@ -123,7 +129,15 @@ def upsert_row(new_row):
         con.commit()
 
 
-# Initialize DB on startup
+def already_scraped(district_code, date):
+    with get_connection() as con:
+        cur = con.execute(
+            "SELECT 1 FROM district_data WHERE district_code=? AND date=?",
+            (district_code, date)
+        )
+        return cur.fetchone() is not None
+
+
 init_db()
 
 
@@ -180,31 +194,21 @@ def open_states_modal():
 # ==============================
 
 def wait_for_district_page(district_name, timeout=15):
-    """
-    Wait until the page breadcrumb confirms this specific district is loaded.
-    The district page has:  <div class="status m_menu" key="district">SOUTH ANDAMANS</div>
-    This element MUST be found — the caller should never proceed without it.
-    Raises TimeoutException if not found within timeout, which the caller must handle
-    as a hard retry/abort (not silently skip).
-    """
     district_upper = district_name.strip().upper()
 
     def correct_district_loaded(d):
         try:
-            result = d.execute_script("""
+            return d.execute_script("""
                 var els = document.querySelectorAll('[key="district"]');
                 for (var i = 0; i < els.length; i++) {
-                    var text = els[i].innerText.trim().toUpperCase();
-                    if (text === arguments[0]) return true;
+                    if (els[i].innerText.trim().toUpperCase() === arguments[0]) return true;
                 }
                 return false;
             """, district_upper)
-            return result
         except Exception:
             return False
 
     WebDriverWait(driver, timeout).until(correct_district_loaded)
-    time.sleep(0.5)  # small buffer for table to fully render
 
 
 # ==============================
@@ -212,44 +216,75 @@ def wait_for_district_page(district_name, timeout=15):
 # ==============================
 
 def wait_for_state_page(timeout=15):
-    """
-    Wait until the district breadcrumb is removed or cleared,
-    signaling that the page has successfully returned to the state view.
-    """
     def state_page_loaded(d):
         return d.execute_script("""
             var els = document.querySelectorAll('[key="district"]');
             return els.length === 0 || els[0].innerText.trim() === '';
         """)
-
     WebDriverWait(driver, timeout).until(state_page_loaded)
-    time.sleep(0.5)
 
 
 # ==============================
-# TABLE PARSER — pure JS, no Selenium element refs
+# WAIT FOR DISTRICT TABLE
+# ==============================
+
+def wait_for_district_table(timeout=TABLE_WAIT_TIMEOUT):
+    """
+    The 'Distributed Quantity(In MT)' table is GUARANTEED on every district page.
+    Poll until it exists outside stateDefaultDivId AND has at least one data row.
+    Timeout = page render stalled — caller will retry.
+    """
+    def table_has_data(d):
+        try:
+            return d.execute_script("""
+                var tables = document.querySelectorAll(
+                    'table[aria-label="Distributed Quantity(In MT)"]'
+                );
+                if (!tables.length) return false;
+
+                for (var t of tables) {
+                    var p = t.parentElement;
+                    var inDefault = false;
+                    while (p) {
+                        if (p.id === 'stateDefaultDivId') { inDefault = true; break; }
+                        p = p.parentElement;
+                    }
+                    if (inDefault) continue;
+
+                    var rows = t.querySelectorAll('tbody tr');
+                    for (var r of rows) {
+                        if (r.querySelectorAll('td').length >= 5) return true;
+                    }
+                }
+                return false;
+            """)
+        except Exception:
+            return False
+
+    WebDriverWait(driver, timeout).until(table_has_data)
+
+
+# ==============================
+# TABLE PARSER
 # ==============================
 
 PARSE_TABLE_JS = """
     var result = [];
-    var tables = document.querySelectorAll('table');
-    for (var t of tables) {
-        var ariaLabel = t.getAttribute('aria-label') || '';
-        var ths = Array.from(t.querySelectorAll('th')).map(function(h){ return h.innerText.trim(); });
-        if (ariaLabel.indexOf('Distributed Quantity') === -1 &&
-            (ths.indexOf('Commodity') === -1 || ths.indexOf('Total') === -1)) continue;
+    var tables = document.querySelectorAll(
+        'table[aria-label="Distributed Quantity(In MT)"]'
+    );
 
+    for (var t of tables) {
+        var p = t.parentElement;
         var inDefault = false;
-        var parent = t.parentElement;
-        while (parent) {
-            if (parent.id === 'stateDefaultDivId') { inDefault = true; break; }
-            parent = parent.parentElement;
+        while (p) {
+            if (p.id === 'stateDefaultDivId') { inDefault = true; break; }
+            p = p.parentElement;
         }
         if (inDefault) continue;
 
-        var rows = t.querySelectorAll('tr');
-        for (var i = 0; i < rows.length; i++) {
-            var row = rows[i];
+        var rows = t.querySelectorAll('tbody tr');
+        for (var row of rows) {
             var cells = row.querySelectorAll('td');
             if (cells.length < 5) continue;
 
@@ -258,16 +293,20 @@ PARSE_TABLE_JS = """
 
             var btn = nameCell.querySelector('.menu-toggle');
             if (btn) {
-                name = btn.innerText.trim();
+                name = btn.innerText.replace(/[+-]/g, '').trim();
             }
 
             if (!name || name.toLowerCase() === 'total') continue;
 
-            var val = cells[4].innerText.trim();
-            var isSub = row.className.indexOf('customRow') !== -1;
+            var convertEl = cells[4].querySelector('.convert');
+            var val = convertEl
+                ? convertEl.innerText.trim()
+                : cells[4].innerText.trim();
 
-            result.push({name: name, val: val, isSub: isSub});
+            var isSub = row.classList.contains('customRow');
+            result.push({ name: name, val: val, isSub: isSub });
         }
+
         return result;
     }
     return result;
@@ -280,15 +319,13 @@ def commodity_to_col(name, is_sub):
 
 
 def parse_table() -> dict:
-    """Extract all commodity data from the district Distributed Quantity table via JS."""
     try:
         rows = driver.execute_script(PARSE_TABLE_JS)
     except Exception as e:
-        pass  # JS parse error; retry will handle
+        print(f"    [PARSE ERROR] {e}")
         return {}
 
     if not rows:
-        pass  # table not found; retry will handle
         return {}
 
     commodity_data = {}
@@ -300,63 +337,164 @@ def parse_table() -> dict:
 
 
 # ==============================
-# DISTRICT SCRAPER WITH MANDATORY ELEMENT ENFORCEMENT
+# DRIVER RELAUNCH
 # ==============================
 
-MAX_DISTRICT_RETRIES = 3
+def relaunch_driver():
+    """Kill the current browser entirely and start a completely fresh one."""
+    global driver, wait
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    driver = webdriver.Chrome(options=make_chrome_options())
+    wait   = WebDriverWait(driver, 20)
+    print("  [RELAUNCH] Fresh browser started")
 
+
+def navigate_to_state_fresh(state):
+    """
+    From a cold fresh browser, navigate all the way to the state view.
+    Called after a relaunch so the next district attempt starts cleanly.
+    """
+    open_home()
+    change_month(TARGET_YEAR, TARGET_MONTH)
+    open_states_modal()
+    for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
+        if state["code"] in (l.get_attribute("onclick") or ""):
+            l.click()
+            break
+    wait_for_js_function("liveDistrictdata")
+    safe_js(f"liveDistrictdata('{state['code']}')")
+    wait_for_state_page()
+    print(f"  [RELAUNCH] Ready at state: {state['name']}")
+
+
+# ==============================
+# NAVIGATE BACK TO STATE (soft, within existing session)
+# ==============================
+
+def navigate_back_to_state(state):
+    """
+    Soft nav: try backData() first. If that fails, full page reload back to state.
+    Used between normal retries (no browser relaunch).
+    """
+    try:
+        safe_js(f"backData('{state['code']}')")
+        wait_for_state_page()
+        return
+    except Exception as e:
+        print(f"    [NAV FAIL] backData failed ({e}) — doing full reload")
+
+    try:
+        open_home()
+        change_month(TARGET_YEAR, TARGET_MONTH)
+        open_states_modal()
+        for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
+            if state["code"] in (l.get_attribute("onclick") or ""):
+                l.click()
+                break
+        wait_for_js_function("liveDistrictdata")
+        safe_js(f"liveDistrictdata('{state['code']}')")
+        wait_for_state_page()
+        print(f"    [NAV OK] Recovered to state: {state['name']}")
+    except Exception as e:
+        print(f"    [NAV CRITICAL] Full reload also failed: {e}")
+
+
+# ==============================
+# DISTRICT SCRAPER
+# ==============================
 
 def scrape_district(d, state):
     """
-    Scrape a single district. Retries up to MAX_DISTRICT_RETRIES times if the
-    district breadcrumb element ([key="district"]) is not found.
-    Raises after exhausting retries — the caller must handle (log + move on to
-    next district, NOT silently skip).
+    Scrape one district. The Distributed Quantity table is GUARANTEED to exist
+    on every district page — so we loop forever until data is extracted and saved.
+
+    Retry strategy:
+      - Every attempt has a DISTRICT_HARD_TIMEOUT ceiling (SIGALRM) to break
+        out of any infinite WebDriverWait hang.
+      - After every ATTEMPTS_BEFORE_RELAUNCH consecutive failures, the browser
+        is killed and relaunched fresh, then navigated back to the state view.
+      - Between relaunches, soft navigate_back_to_state is used.
+      - Empty parse result = retry (table is guaranteed, empty = render incomplete).
+      - The only exit from the while loop is a successful DB save.
     """
-    last_exc = None
+    date_str = f"{TARGET_YEAR}-{TARGET_MONTH:02d}"
 
-    for attempt in range(1, MAX_DISTRICT_RETRIES + 1):
+    if already_scraped(d["code"], date_str):
+        print(f"  [SKIP] {d['name']} already in DB")
+        return
+
+    attempt = 0
+
+    while True:  # guaranteed table = loop until saved
+        attempt += 1
+
+        # Every ATTEMPTS_BEFORE_RELAUNCH failures: relaunch browser entirely
+        if attempt > 1 and (attempt - 1) % ATTEMPTS_BEFORE_RELAUNCH == 0:
+            print(f"  [RELAUNCH] {attempt - 1} attempts failed for "
+                  f"'{d['name']}' — killing and relaunching browser")
+            relaunch_driver()
+            navigate_to_state_fresh(state)
+
+        # Arm hard timeout for this attempt
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(DISTRICT_HARD_TIMEOUT)
+
         try:
-            print(f"  [{attempt}/{MAX_DISTRICT_RETRIES}] Scraping: {d['name']}")
+            print(f"  [attempt {attempt}] Scraping: {d['name']}")
 
+            # 1. Navigate to district
             wait_for_js_function("stateData")
             safe_js(f"stateData('{d['code']}')")
 
-            # This is the mandatory guard — must confirm the correct district page
-            # is rendered before reading any data. TimeoutException here triggers retry.
+            # 2. Confirm breadcrumb
             wait_for_district_page(d["name"])
 
+            # 3. Wait for guaranteed table to have real rows
+            wait_for_district_table(timeout=TABLE_WAIT_TIMEOUT)
+
+            # 4. Parse
             commodities = parse_table()
 
+            # 5. Empty = render not complete, retry
+            if not commodities:
+                raise ValueError(
+                    f"Table present but parse returned empty for '{d['name']}'"
+                )
+
+            # 6. Save
             row = {
-                "state": state["name"],
-                "district": d["name"],
+                "state":         state["name"],
+                "district":      d["name"],
                 "district_code": d["code"],
-                "date": f"{TARGET_YEAR}-{TARGET_MONTH:02d}",
+                "date":          date_str,
                 **commodities
             }
-
             fill_missing_sub_columns(row)
             upsert_row(row)
-            print(f"  [OK] {d['name']} — inserted")
-            return  # success
+
+            signal.alarm(0)  # disarm on success
+            print(f"  [OK] {d['name']} — {len(commodities)} commodities saved")
+            return  # only exit: successful save
+
+        except DistrictTimeout:
+            # Page completely hung — SIGALRM fired
+            print(f"  [HARD TIMEOUT] '{d['name']}' attempt {attempt} "
+                  f"exceeded {DISTRICT_HARD_TIMEOUT}s")
+            navigate_back_to_state(state)
+            time.sleep(2)  # short wait after timeout
 
         except Exception as e:
-            last_exc = e
-            print(f"  [RETRY {attempt}/{MAX_DISTRICT_RETRIES}] {d['name']} — {type(e).__name__}")
-            # Navigate back to state view before retrying
-            try:
-                safe_js(f"backData('{state['code']}')")
-                wait_for_state_page()
-            except Exception:
-                pass
-            time.sleep(1)
+            signal.alarm(0)
+            print(f"  [RETRY {attempt}] '{d['name']}' "
+                  f"— {type(e).__name__}: {e}")
+            navigate_back_to_state(state)
+            time.sleep(min(2 ** attempt, 30))  # exponential, capped at 30s
 
-    # All retries exhausted — raise so caller can log and continue to next district
-    raise RuntimeError(
-        f"District '{d['name']}' (code: {d['code']}) failed after "
-        f"{MAX_DISTRICT_RETRIES} attempts. Last error: {last_exc}"
-    )
+        finally:
+            signal.alarm(0)  # always disarm
 
 
 # ==============================
@@ -369,10 +507,10 @@ try:
     open_states_modal()
 
     states = []
-    links = driver.find_elements(By.CSS_SELECTOR, "#myModal11 a")
+    links  = driver.find_elements(By.CSS_SELECTOR, "#myModal11 a")
     for l in links:
         onclick = l.get_attribute("onclick")
-        match = re.search(r"stateData\('(\d+)'\)", str(onclick))
+        match   = re.search(r"stateData\('(\d+)'\)", str(onclick))
         if match:
             states.append({
                 "name": l.text.strip(),
@@ -388,7 +526,6 @@ try:
         open_home()
         open_states_modal()
 
-        # click state
         for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
             if state["code"] in (l.get_attribute("onclick") or ""):
                 l.click()
@@ -396,9 +533,12 @@ try:
 
         wait_for_js_function("liveDistrictdata")
         safe_js(f"liveDistrictdata('{state['code']}')")
-        time.sleep(2)
 
-        # collect districts
+        # Wait for district links — no blind sleep
+        wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "a[onclick*='stateData(']")
+        ))
+
         districts = []
         for l in driver.find_elements(By.TAG_NAME, "a"):
             onclick = l.get_attribute("onclick")
@@ -412,24 +552,22 @@ try:
                             "code": match.group(1)
                         })
 
-        # dedupe
-        seen = set()
-        districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
+        # Deduplicate
+        seen      = set()
+        districts = [
+            d for d in districts
+            if not (d["code"] in seen or seen.add(d["code"]))
+        ]
         print(f"[INFO] {len(districts)} districts found")
 
         for d in districts:
+            scrape_district(d, state)  # loops forever internally until saved
+            # always return to state view before next district
             try:
-                scrape_district(d, state)
-            except RuntimeError as e:
-                # District exhausted all retries — log it and continue to the next one
-                print(f"  [FAILED] {d['name']} — exhausted {MAX_DISTRICT_RETRIES} retries")
-            finally:
-                # Always navigate back to state view before next district
-                try:
-                    safe_js(f"backData('{state['code']}')")
-                    wait_for_state_page()
-                except Exception:
-                    pass
+                safe_js(f"backData('{state['code']}')")
+                wait_for_state_page()
+            except Exception:
+                pass
 
 except Exception:
     import traceback

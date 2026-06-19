@@ -15,7 +15,7 @@ on:
 jobs:
   scrape:
     strategy:
-      fail-fast: false   # if one chunk fails, others keep running
+      fail-fast: false
       matrix:
         include:
           - start: 0
@@ -23,26 +23,25 @@ jobs:
           - start: 9
             end: 18
           - start: 18
-            end: 27
-          - start: 27
+            end: 26
+          - start: 26
             end: 99
 
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4        # ✅ v4 already Node 24 compatible
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5   # ✅ v5 already Node 24 compatible
         with:
           python-version: '3.10'
 
       - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-
-      - name: Install ChromeDriver
-        uses: nanasess/setup-chromedriver@v2
+        uses: browser-actions/setup-chrome@v2   # ✅ v2 is Node 24 compatible (was v1)
+        with:
+          install-chromedriver: true             # ✅ no need for separate chromedriver action
 
       - name: Install dependencies
         run: pip install selenium
@@ -56,13 +55,13 @@ jobs:
             --month ${{ github.event.inputs.month || '4' }}
 
       - name: Upload DB chunk
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4   # ✅ v4 already Node 24 compatible
         with:
           name: db-${{ matrix.start }}-${{ matrix.end }}
           path: "*.db"
 
   merge:
-    needs: scrape   # waits for ALL 4 scrape jobs to finish
+    needs: scrape
     runs-on: ubuntu-latest
 
     steps:
@@ -75,7 +74,7 @@ jobs:
           python-version: '3.10'
 
       - name: Download all DB chunks
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4   # ✅ v4 already Node 24 compatible
         with:
           path: dbs/
 
