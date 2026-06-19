@@ -540,52 +540,37 @@ try:
 
         print(f"\n{'='*50}\n[STATE] {state['name']}")
 
-        open_home()
-        open_states_modal()
-
-        for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
-            if state["code"] in (l.get_attribute("onclick") or ""):
-                l.click()
-                break
-
-        wait_for_js_function("liveDistrictdata")
-        safe_js(f"liveDistrictdata('{state['code']}')")
-
-        # Wait for district links to appear — no blind sleep
-        wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "a[onclick*='stateData(']")
-        ))
-
-        districts = []
-        for l in driver.find_elements(By.TAG_NAME, "a"):
-            onclick = l.get_attribute("onclick")
-            if onclick and "stateData(" in onclick:
-                match = re.search(r"stateData\('(\d+)'\)", onclick)
-                if match:
-                    imgs = l.find_elements(By.TAG_NAME, "img")
-                    if imgs and imgs[0].get_attribute("width") == "12":
-                        districts.append({
-                            "name": imgs[0].get_attribute("aria-label"),
-                            "code": match.group(1)
-                        })
-
-        # Deduplicate
-        seen      = set()
-        districts = [
-            d for d in districts
-            if not (d["code"] in seen or seen.add(d["code"]))
-        ]
-        print(f"[INFO] {len(districts)} districts found")
-
-        for d in districts:
-            scrape_district(d, state)  # loops forever internally until saved
-            # always return to state view before next district
+        # Retry state navigation up to 3 times with full reload each time
+        for nav_attempt in range(1, 4):
             try:
-                safe_js(f"backData('{state['code']}')")
-                wait_for_state_page()
-            except Exception:
-                pass
+                open_home()
 
+                # Wait for the page to be fully interactive before clicking modal
+                wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
+
+                open_states_modal()
+
+                for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
+                    if state["code"] in (l.get_attribute("onclick") or ""):
+                        l.click()
+                        break
+
+                wait_for_js_function("liveDistrictdata")
+                safe_js(f"liveDistrictdata('{state['code']}')")
+
+                wait.until(EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "a[onclick*='stateData(']")
+                ))
+                break  # navigation succeeded
+
+            except Exception as e:
+                print(f"  [STATE NAV RETRY {nav_attempt}/3] {state['name']} — {type(e).__name__}: {e}")
+                if nav_attempt == 3:
+                    # Full browser relaunch if all nav attempts fail
+                    print(f"  [STATE RELAUNCH] Relaunching browser for {state['name']}")
+                    relaunch_driver()
+                time.sleep(3)
+                
 except Exception:
     import traceback
     traceback.print_exc()
