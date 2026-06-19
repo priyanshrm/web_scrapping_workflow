@@ -280,16 +280,13 @@ def commodity_to_col(name, is_sub):
 
 
 def parse_table() -> dict:
-    """Extract all commodity data from the district Distributed Quantity table via JS."""
     try:
         rows = driver.execute_script(PARSE_TABLE_JS)
     except Exception as e:
-        pass  # JS parse error; retry will handle
-        return {}
+        raise RuntimeError(f"JS execution failed: {e}")
 
     if not rows:
-        pass  # table not found; retry will handle
-        return {}
+        raise RuntimeError("Table returned no rows — district data not yet rendered")
 
     commodity_data = {}
     for r in rows:
