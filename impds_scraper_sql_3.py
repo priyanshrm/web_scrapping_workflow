@@ -1,10 +1,12 @@
 import re
+import os
 import time
 import signal
 import sqlite3
 import argparse
 
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -32,15 +34,13 @@ DB_FILE  = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}.db"
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
 KEY_FIELDS   = ["state", "district_code", "date"]
 
-# The Distributed Quantity table is GUARANTEED on every district page.
-# Loop forever until extracted. Relaunch browser every N failures.
 TABLE_WAIT_TIMEOUT    = 20    # seconds to wait for table per attempt
-DISTRICT_HARD_TIMEOUT = 180   # 3 min hard ceiling per attempt (kills hung waits)
-ATTEMPTS_BEFORE_RELAUNCH = 3  # relaunch browser after every 3 consecutive failures
+DISTRICT_HARD_TIMEOUT = 180   # 3 min hard ceiling per attempt
+ATTEMPTS_BEFORE_RELAUNCH = 3  # relaunch browser after every N consecutive failures
 
 
 # ==============================
-# CHROME OPTIONS (reused on relaunch)
+# CHROME SETUP
 # ==============================
 
 def make_chrome_options():
@@ -51,10 +51,27 @@ def make_chrome_options():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--start-maximized")
+
+    # Use the exact Chrome binary installed by setup-chrome@v2
+    chrome_path = os.environ.get("CHROME_PATH")
+    if chrome_path:
+        opts.binary_location = chrome_path
+
     return opts
 
 
-driver = webdriver.Chrome(options=make_chrome_options())
+def make_driver():
+    """
+    Create a Chrome driver using the matched Chrome + ChromeDriver pair
+    installed by browser-actions/setup-chrome@v2.
+    Falls back to system defaults if env vars are not set (local runs).
+    """
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+    service = Service(executable_path=chromedriver_path) if chromedriver_path else Service()
+    return webdriver.Chrome(service=service, options=make_chrome_options())
+
+
+driver = make_driver()
 wait   = WebDriverWait(driver, 20)
 
 
@@ -232,7 +249,7 @@ def wait_for_district_table(timeout=TABLE_WAIT_TIMEOUT):
     """
     The 'Distributed Quantity(In MT)' table is GUARANTEED on every district page.
     Poll until it exists outside stateDefaultDivId AND has at least one data row.
-    Timeout = page render stalled — caller will retry.
+    Timeout here means page render stalled — caller retries the whole attempt.
     """
     def table_has_data(d):
         try:
@@ -341,13 +358,13 @@ def parse_table() -> dict:
 # ==============================
 
 def relaunch_driver():
-    """Kill the current browser entirely and start a completely fresh one."""
+    """Kill the current browser entirely and start a fresh matched pair."""
     global driver, wait
     try:
         driver.quit()
     except Exception:
         pass
-    driver = webdriver.Chrome(options=make_chrome_options())
+    driver = make_driver()
     wait   = WebDriverWait(driver, 20)
     print("  [RELAUNCH] Fresh browser started")
 
@@ -415,7 +432,8 @@ def scrape_district(d, state):
       - Every attempt has a DISTRICT_HARD_TIMEOUT ceiling (SIGALRM) to break
         out of any infinite WebDriverWait hang.
       - After every ATTEMPTS_BEFORE_RELAUNCH consecutive failures, the browser
-        is killed and relaunched fresh, then navigated back to the state view.
+        is killed and relaunched fresh with a matched Chrome+ChromeDriver pair,
+        then navigated back to the state view.
       - Between relaunches, soft navigate_back_to_state is used.
       - Empty parse result = retry (table is guaranteed, empty = render incomplete).
       - The only exit from the while loop is a successful DB save.
@@ -480,18 +498,17 @@ def scrape_district(d, state):
             return  # only exit: successful save
 
         except DistrictTimeout:
-            # Page completely hung — SIGALRM fired
             print(f"  [HARD TIMEOUT] '{d['name']}' attempt {attempt} "
                   f"exceeded {DISTRICT_HARD_TIMEOUT}s")
             navigate_back_to_state(state)
-            time.sleep(2)  # short wait after timeout
+            time.sleep(2)
 
         except Exception as e:
             signal.alarm(0)
             print(f"  [RETRY {attempt}] '{d['name']}' "
                   f"— {type(e).__name__}: {e}")
             navigate_back_to_state(state)
-            time.sleep(min(2 ** attempt, 30))  # exponential, capped at 30s
+            time.sleep(min(2 ** attempt, 30))
 
         finally:
             signal.alarm(0)  # always disarm
@@ -534,7 +551,7 @@ try:
         wait_for_js_function("liveDistrictdata")
         safe_js(f"liveDistrictdata('{state['code']}')")
 
-        # Wait for district links — no blind sleep
+        # Wait for district links to appear — no blind sleep
         wait.until(EC.presence_of_element_located(
             (By.CSS_SELECTOR, "a[onclick*='stateData(']")
         ))

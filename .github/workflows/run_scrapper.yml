@@ -39,14 +39,19 @@ jobs:
           python-version: '3.10'
 
       - name: Install Chrome
-        uses: browser-actions/setup-chrome@v2   # ✅ v2 is Node 24 compatible (was v1)
+        uses: browser-actions/setup-chrome@v2
+        id: setup-chrome                                      # ← needs this id
         with:
-          install-chromedriver: true             # ✅ no need for separate chromedriver action
+          install-chromedriver: true
+
 
       - name: Install dependencies
         run: pip install selenium
 
       - name: Run Scraper
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: |
           python impds_scraper_sql_3.py \
             --start ${{ matrix.start }} \
