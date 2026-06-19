@@ -42,6 +42,7 @@ jobs:
         uses: browser-actions/setup-chrome@v2
         id: setup-chrome                                      # ← needs this id
         with:
+          chrome-version: '149'  
           install-chromedriver: true
 
 
