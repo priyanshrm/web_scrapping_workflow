@@ -103,6 +103,6 @@ jobs:
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
-          git add *_FINAL.db || echo "No DB generated"
+          git add *_FINAL_*.db || echo "No DB generated"
           git commit -m "Auto-updated scraped district data [skip ci]" || exit 0
           git push
