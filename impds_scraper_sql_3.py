@@ -427,6 +427,7 @@ try:
                     wait_for_state_page()
                 except Exception:
                     pass
+            break
 
 except Exception:
     import traceback
