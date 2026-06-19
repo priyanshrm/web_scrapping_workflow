@@ -2,6 +2,7 @@ import re
 import time
 import os
 import sqlite3
+import json
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -29,6 +30,12 @@ parser.add_argument(
         "to the next district if the current one exhausts its retries."
     ),
 )
+parser.add_argument(
+    "--resume-state",
+    type=int,
+    default=None,
+    help="Index into the states list to resume from (overrides --start for this run's starting point).",
+)
 args = parser.parse_args()
 
 TARGET_YEAR = args.year
@@ -39,6 +46,7 @@ SCRAPE_MODE = args.mode  # "all" or "one"
 
 BASE_URL = "https://impds.nic.in/sale/"
 DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}_{SCRAPE_MODE}.db"
+PROGRESS_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}_{SCRAPE_MODE}.progress.json"
 
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
 KEY_FIELDS = ["state", "district_code", "date"]
@@ -46,23 +54,75 @@ KEY_FIELDS = ["state", "district_code", "date"]
 # Retry tuning
 MAX_DISTRICT_RETRIES = 5      # district-level retries (re-click + re-wait + re-parse)
 MAX_STATE_RETRIES = 3         # state-level retries (re-open state, re-collect districts)
+MAX_BROWSER_RESTARTS = 10     # hard cap on full incognito restarts per run, sanity guard
 TABLE_POLL_TIMEOUT = 20       # seconds to wait for a *verified* table per attempt
 TABLE_POLL_INTERVAL = 0.4     # seconds between verification polls
+MODAL_VERIFY_TIMEOUT = 8      # seconds to confirm #myModal11 actually appeared
+
+DISTRICTS_BEFORE_PROACTIVE_RESTART = 60  # periodic restart to dodge memory creep
+
+browser_restart_count = 0
+
 
 # ==============================
-# DRIVER
+# DRIVER (re-creatable)
 # ==============================
 
-options = webdriver.ChromeOptions()
-options.add_argument("--headless")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--disable-gpu")
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--start-maximized")
+def build_driver():
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--start-maximized")
+    options.add_argument("--incognito")
+    d = webdriver.Chrome(options=options)
+    w = WebDriverWait(d, 20)
+    return d, w
 
-driver = webdriver.Chrome(options=options)
-wait = WebDriverWait(driver, 20)
+
+driver, wait = build_driver()
+
+
+def restart_browser(reason="periodic"):
+    """
+    Quit the current driver and launch a brand new one in incognito mode.
+    This is the 'nuclear option' recovery: full page/session state corruption
+    can't be fixed by re-clicking, only by starting over with a clean browser.
+    """
+    global driver, wait, browser_restart_count
+    browser_restart_count += 1
+    print(f"  [BROWSER RESTART #{browser_restart_count}] reason={reason}")
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    driver, wait = build_driver()
+    open_home()
+    change_month(TARGET_YEAR, TARGET_MONTH)
+
+
+# ==============================
+# PROGRESS TRACKING (so a restart resumes, not starts over)
+# ==============================
+
+def save_progress(state_index, state_name):
+    try:
+        with open(PROGRESS_FILE, "w") as f:
+            json.dump({"state_index": state_index, "state_name": state_name}, f)
+    except Exception:
+        pass
+
+
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 # ==============================
@@ -185,9 +245,19 @@ def change_month(year, month):
 
 
 def open_states_modal():
+    """
+    Click the '33 states' link (liveStatesdata()) and VERIFY the modal
+    actually became visible. This is the key fix: previously we clicked
+    and assumed success, which let a corrupted page silently fail every
+    district downstream. Now a failed-to-open modal is detected immediately
+    and raised, so the caller can trigger a full browser restart instead of
+    cascading timeouts.
+    """
     btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.textInfo")))
     btn.click()
-    wait.until(EC.visibility_of_element_located((By.ID, "myModal11")))
+    WebDriverWait(driver, MODAL_VERIFY_TIMEOUT).until(
+        EC.visibility_of_element_located((By.ID, "myModal11"))
+    )
 
 
 # ==============================
@@ -229,6 +299,23 @@ def wait_for_state_page(timeout=15):
 
     WebDriverWait(driver, timeout).until(state_page_loaded)
     time.sleep(0.5)
+
+
+def go_back(state_code, from_timeout=15):
+    """
+    Click the 'Go back' (fa-hand-o-left) button, which calls backData(state_code).
+    This single button is used BOTH to go from district -> state view AND from
+    state -> home view, always keyed on the current state's code.
+    Returns True if the back-navigation is confirmed, False otherwise
+    (caller decides whether that warrants a harder recovery step).
+    """
+    try:
+        safe_js(f"backData('{state_code}')")
+        wait_for_state_page(timeout=from_timeout)
+        return True
+    except Exception as e:
+        print(f"  [BACK FAILED] backData('{state_code}') — {type(e).__name__}: {e}")
+        return False
 
 
 # ==============================
@@ -341,16 +428,16 @@ def wait_for_verified_table(timeout=TABLE_POLL_TIMEOUT, interval=TABLE_POLL_INTE
 
 # ==============================
 # DISTRICT SCRAPER — only ever returns after a VERIFIED successful extraction,
-# or raises after exhausting retries.
+# or raises after exhausting retries AND exhausting browser restarts.
 # ==============================
 
-def scrape_district(d, state):
+def _scrape_district_attempts(d, state):
     """
-    Scrape a single district. Retries up to MAX_DISTRICT_RETRIES times.
-    A district is only considered done (DB write happens) once
-    wait_for_verified_table() confirms real data was read.
-    Raises RuntimeError after exhausting retries — caller must catch, log,
-    and move on to the next district.
+    One full pass of MAX_DISTRICT_RETRIES attempts at a single district,
+    using the CURRENT browser session. Does not restart the browser itself.
+    Returns silently on verified success. Raises RuntimeError if every
+    attempt in this pass fails (caller decides whether to restart and
+    try another pass, or give up on the district).
     """
     last_exc = None
 
@@ -383,17 +470,78 @@ def scrape_district(d, state):
         except Exception as e:
             last_exc = e
             print(f"  [RETRY {attempt}/{MAX_DISTRICT_RETRIES}] {d['name']} — {type(e).__name__}: {e}")
-            # Navigate back to state view before retrying
-            try:
-                safe_js(f"backData('{state['code']}')")
-                wait_for_state_page()
-            except Exception:
-                pass
+            # Navigate back to state view before the next attempt. If that
+            # also fails, the page is corrupted beyond what an in-session
+            # retry can fix — bail out of this pass immediately so the
+            # caller can restart the browser rather than burning remaining
+            # attempts against a broken DOM.
+            if not go_back(state["code"]):
+                raise RuntimeError(
+                    f"backData failed mid-retry for '{d['name']}' "
+                    f"(attempt {attempt}/{MAX_DISTRICT_RETRIES})"
+                ) from e
             time.sleep(1)
 
     raise RuntimeError(
         f"District '{d['name']}' (code: {d['code']}) failed after "
         f"{MAX_DISTRICT_RETRIES} attempts. Last error: {last_exc}"
+    )
+
+
+def scrape_district(d, state):
+    """
+    Scrape a single district, with full incognito-browser-restart recovery.
+
+    Behavior:
+      1. Try a full pass of MAX_DISTRICT_RETRIES attempts in the current
+         browser session (_scrape_district_attempts).
+      2. If that pass fails for ANY reason (table never loaded, backData
+         broke, etc.) — relaunch Chrome fresh in incognito mode, navigate
+         back to this exact state's district list, and try the SAME
+         district again from where it stopped. Do not skip ahead.
+      3. Repeat up to MAX_BROWSER_RESTARTS times total for this district.
+      4. Only if every pass across every restart fails does this raise
+         RuntimeError, at which point the caller logs it as a genuine
+         [FAILED] and moves on to the next district.
+
+    Returns silently on verified success (matches previous contract).
+    """
+    restarts_used = 0
+    last_exc = None
+
+    while True:
+        try:
+            _scrape_district_attempts(d, state)
+            return  # verified success
+        except RuntimeError as e:
+            last_exc = e
+            restarts_used += 1
+            print(f"  [DISTRICT RETRIES EXHAUSTED] {d['name']} — {e}")
+
+            if restarts_used > MAX_BROWSER_RESTARTS:
+                break  # give up on this district entirely
+
+            print(f"  [RELAUNCH] Restarting Chrome (incognito) to retry "
+                  f"'{d['name']}' — restart {restarts_used}/{MAX_BROWSER_RESTARTS}")
+            restart_browser(reason=f"district retries exhausted ({d['name']})")
+
+            # After a restart we're back at the home/month-select page, not
+            # this state's district list — re-enter the state before
+            # retrying the same district, so we "pick up where it stopped"
+            # rather than skipping to the next district.
+            try:
+                collect_districts_for_state(state)
+            except RuntimeError as state_exc:
+                # Couldn't even get back into the state after restarting —
+                # no point hammering this district further.
+                last_exc = state_exc
+                print(f"  [STATE RE-ENTRY FAILED] {state['name']} — {state_exc}")
+                break
+            # Loop continues: try the same district `d` again, fresh.
+
+    raise RuntimeError(
+        f"District '{d['name']}' (code: {d['code']}) failed even after "
+        f"{restarts_used - 1} browser restart(s). Last error: {last_exc}"
     )
 
 
@@ -405,6 +553,9 @@ def collect_districts_for_state(state):
     """
     Navigate to a state's district list and return the list of districts.
     Retries the whole navigation sequence up to MAX_STATE_RETRIES times.
+    If the states modal itself fails to open (open_states_modal raises),
+    that's treated as a signal of page corruption and triggers a full
+    browser restart before the next attempt.
     Raises RuntimeError if it never succeeds.
     """
     last_exc = None
@@ -452,7 +603,13 @@ def collect_districts_for_state(state):
         except Exception as e:
             last_exc = e
             print(f"  [STATE RETRY {attempt}/{MAX_STATE_RETRIES}] {state['name']} — {type(e).__name__}: {e}")
-            time.sleep(2)
+            # If the states modal itself wouldn't open, this is exactly the
+            # failure mode that requires closing the browser and reopening
+            # fresh (incognito) rather than retrying in the same session.
+            if "myModal11" in str(e) or isinstance(e, RuntimeError) and "Could not find clickable link" in str(e):
+                restart_browser(reason=f"states modal failed to open ({state['name']})")
+            else:
+                time.sleep(2)
 
     raise RuntimeError(
         f"State '{state['name']}' (code: {state['code']}) failed to load districts after "
@@ -466,42 +623,64 @@ def collect_districts_for_state(state):
 
 def scrape_districts_for_state(districts, state, mode):
     """
-    Drive district scraping for a single state according to `mode`:
+    Drive district scraping for a single state according to `mode`.
 
-      "all" — scrape every district. A district that exhausts its retries
-              is logged and skipped; the rest of the state's districts are
-              still attempted.
+    `scrape_district` now owns its own full recovery loop internally:
+    it retries MAX_DISTRICT_RETRIES times, and if that's exhausted it
+    relaunches Chrome in incognito, re-enters this exact state, and
+    retries the SAME district again — up to MAX_BROWSER_RESTARTS times —
+    before ever raising. So by the time scrape_district raises here,
+    the district has been genuinely exhausted and is logged + skipped.
 
-      "one" — scrape districts in order until ONE is successfully verified
-              and inserted, then stop. If a district exhausts its retries,
-              fall through to the next district instead of giving up on the
-              state outright. Only if every district fails does the state
-              end up with zero rows.
-
-    Always navigates back to the state view between districts, regardless
-    of mode or outcome.
+    This function also tracks a running count of districts scraped since
+    the last browser restart, and proactively restarts (fresh incognito
+    session) after DISTRICTS_BEFORE_PROACTIVE_RESTART districts to dodge
+    the slow memory/DOM creep that caused cascading timeouts late in a run.
+    A proactive restart re-enters the state and resumes from the NEXT
+    district in the list (the current one already succeeded or was
+    genuinely exhausted before we got here).
     """
-    got_one = False
+    global districts_since_restart
 
-    for d in districts:
+    got_one = False
+    i = 0
+    while i < len(districts):
+        d = districts[i]
         try:
             scrape_district(d, state)
             got_one = True
-        except RuntimeError:
-            print(f"  [FAILED] {d['name']} — exhausted {MAX_DISTRICT_RETRIES} retries")
-        finally:
-            try:
-                safe_js(f"backData('{state['code']}')")
-                wait_for_state_page()
-            except Exception:
-                pass
+        except RuntimeError as e:
+            # Genuinely exhausted: retries AND restarts both ran out.
+            print(f"  [FAILED] {d['name']} — exhausted retries and restarts — {e}")
+
+        districts_since_restart += 1
+
+        # Always try to land back on the state's district view before
+        # moving to the next district.
+        if not go_back(state["code"]):
+            restart_browser(reason="backData failed after district loop")
+            collect_districts_for_state(state)  # re-enter same state
+
+        if districts_since_restart >= DISTRICTS_BEFORE_PROACTIVE_RESTART:
+            districts_since_restart = 0
+            restart_browser(reason="proactive periodic restart")
+            districts = collect_districts_for_state(state)  # refresh district list/session
+            # Resume from the NEXT district — the one we just finished
+            # (success or genuine failure) is already accounted for.
+            i += 1
+            continue
 
         if mode == "one" and got_one:
             break  # we have our one verified district for this state
 
+        i += 1
+
     if mode == "one" and not got_one:
         print(f"  [STATE FAILED] {state['name']} — no district could be scraped "
               f"(tried all {len(districts)} districts)")
+
+
+districts_since_restart = 0
 
 
 # ==============================
@@ -526,12 +705,17 @@ try:
 
     print(f"[INFO] {len(states)} states found — processing [{START_STATE}:{END_STATE}] — mode={SCRAPE_MODE}")
 
-    for state in states[START_STATE:END_STATE]:
+    # Resume support: if a --resume-state index is given, start there instead.
+    effective_start = args.resume_state if args.resume_state is not None else START_STATE
 
-        print(f"\n{'='*50}\n[STATE] {state['name']}")
+    state_index = effective_start
+    state_list = states[effective_start:END_STATE]
 
-        # Per-state isolation: a state that never loads is logged and skipped,
-        # it does NOT abort the whole batch.
+    for offset, state in enumerate(state_list):
+        state_index = effective_start + offset
+        print(f"\n{'='*50}\n[STATE] {state['name']} (index {state_index})")
+        save_progress(state_index, state['name'])
+
         try:
             districts = collect_districts_for_state(state)
         except RuntimeError as e:
@@ -540,6 +724,9 @@ try:
 
         print(f"[INFO] {len(districts)} districts found")
 
+        # scrape_district (called within) owns all retry/restart recovery
+        # internally now, so this never raises mid-state — it always runs
+        # to completion for this state's district list.
         scrape_districts_for_state(districts, state, SCRAPE_MODE)
 
 except Exception:
@@ -548,4 +735,7 @@ except Exception:
 
 finally:
     print(f"\n{'='*50}\n[DONE] Data saved to {DB_FILE}")
-    driver.quit()
+    try:
+        driver.quit()
+    except Exception:
+        pass
