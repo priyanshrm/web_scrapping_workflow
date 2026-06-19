@@ -19,18 +19,36 @@ parser.add_argument("--start", type=int, default=0)
 parser.add_argument("--end", type=int, default=None)
 parser.add_argument("--year", type=int, default=2023)
 parser.add_argument("--month", type=int, default=4)
+parser.add_argument(
+    "--mode",
+    choices=["all", "one"],
+    default="all",
+    help=(
+        "'all' = scrape every district in each state (default). "
+        "'one' = scrape only one verified district per state, falling back "
+        "to the next district if the current one exhausts its retries."
+    ),
+)
 args = parser.parse_args()
 
 TARGET_YEAR = args.year
 TARGET_MONTH = args.month
 START_STATE = args.start
 END_STATE = args.end if args.end != 99 else None
+SCRAPE_MODE = args.mode  # "all" or "one"
 
 BASE_URL = "https://impds.nic.in/sale/"
-DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}.db"
+DB_FILE = f"{TARGET_YEAR}_{TARGET_MONTH}_{START_STATE}_{END_STATE}_{SCRAPE_MODE}.db"
 
 FIXED_FIELDS = ["state", "district", "district_code", "date"]
 KEY_FIELDS = ["state", "district_code", "date"]
+
+# Retry tuning
+MAX_DISTRICT_RETRIES = 5      # district-level retries (re-click + re-wait + re-parse)
+MAX_STATE_RETRIES = 3         # state-level retries (re-open state, re-collect districts)
+TABLE_POLL_TIMEOUT = 20       # seconds to wait for a *verified* table per attempt
+TABLE_POLL_INTERVAL = 0.4     # seconds between verification polls
+
 # ==============================
 # DRIVER
 # ==============================
@@ -58,10 +76,7 @@ def get_connection():
 def init_db():
     """Create the table with fixed columns if it doesn't exist."""
     with get_connection() as con:
-        cols_def = ", ".join(
-            f'"{c}" TEXT' if c != "district_code" else f'"{c}" TEXT'
-            for c in FIXED_FIELDS
-        )
+        cols_def = ", ".join(f'"{c}" TEXT' for c in FIXED_FIELDS)
         con.execute(f"""
             CREATE TABLE IF NOT EXISTS district_data (
                 {cols_def},
@@ -108,7 +123,6 @@ def upsert_row(new_row):
     ensure_columns(new_row.keys())
     all_cols = get_existing_columns()
 
-    # Build the full row dict, filling any missing columns with empty string
     full_row = {col: new_row.get(col, "") for col in all_cols}
 
     cols_sql = ", ".join(f'"{c}"' for c in all_cols)
@@ -123,7 +137,6 @@ def upsert_row(new_row):
         con.commit()
 
 
-# Initialize DB on startup
 init_db()
 
 
@@ -138,12 +151,14 @@ def wait_for_js_function(name, timeout=10):
 
 
 def safe_js(script):
+    last_exc = None
     for _ in range(3):
         try:
             return driver.execute_script(script)
-        except Exception:
+        except Exception as e:
+            last_exc = e
             time.sleep(1)
-    raise Exception(f"JS failed: {script}")
+    raise RuntimeError(f"JS failed after retries: {script} ({last_exc})")
 
 
 # ==============================
@@ -176,22 +191,21 @@ def open_states_modal():
 
 
 # ==============================
-# WAIT FOR CORRECT DISTRICT PAGE
+# WAIT FOR CORRECT DISTRICT PAGE (breadcrumb only — necessary but not sufficient)
 # ==============================
 
 def wait_for_district_page(district_name, timeout=15):
     """
     Wait until the page breadcrumb confirms this specific district is loaded.
-    The district page has:  <div class="status m_menu" key="district">SOUTH ANDAMANS</div>
-    This element MUST be found — the caller should never proceed without it.
-    Raises TimeoutException if not found within timeout, which the caller must handle
-    as a hard retry/abort (not silently skip).
+    This only confirms navigation succeeded — it does NOT confirm the
+    Distributed Quantity table has finished rendering. Use
+    wait_for_verified_table() afterwards for that.
     """
     district_upper = district_name.strip().upper()
 
     def correct_district_loaded(d):
         try:
-            result = d.execute_script("""
+            return d.execute_script("""
                 var els = document.querySelectorAll('[key="district"]');
                 for (var i = 0; i < els.length; i++) {
                     var text = els[i].innerText.trim().toUpperCase();
@@ -199,23 +213,14 @@ def wait_for_district_page(district_name, timeout=15):
                 }
                 return false;
             """, district_upper)
-            return result
         except Exception:
             return False
 
     WebDriverWait(driver, timeout).until(correct_district_loaded)
-    time.sleep(0.5)  # small buffer for table to fully render
 
-
-# ==============================
-# WAIT FOR STATE PAGE
-# ==============================
 
 def wait_for_state_page(timeout=15):
-    """
-    Wait until the district breadcrumb is removed or cleared,
-    signaling that the page has successfully returned to the state view.
-    """
+    """Wait until the district breadcrumb is removed/cleared (back on state view)."""
     def state_page_loaded(d):
         return d.execute_script("""
             var els = document.querySelectorAll('[key="district"]');
@@ -248,6 +253,9 @@ PARSE_TABLE_JS = """
         if (inDefault) continue;
 
         var rows = t.querySelectorAll('tr');
+        var sawTotal = false;
+        var totalNonEmpty = false;
+
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
             var cells = row.querySelectorAll('td');
@@ -261,16 +269,29 @@ PARSE_TABLE_JS = """
                 name = btn.innerText.trim();
             }
 
-            if (!name || name.toLowerCase() === 'total') continue;
+            if (!name) continue;
 
             var val = cells[4].innerText.trim();
-            var isSub = row.className.indexOf('customRow') !== -1;
 
+            if (name.toLowerCase() === 'total') {
+                sawTotal = true;
+                if (val !== '') totalNonEmpty = true;
+                continue;
+            }
+
+            var isSub = row.className.indexOf('customRow') !== -1;
             result.push({name: name, val: val, isSub: isSub});
         }
-        return result;
+
+        // Only accept this table as the right one if it actually has a
+        // populated Total row — otherwise treat it as "not rendered yet".
+        if (sawTotal && totalNonEmpty && result.length > 0) {
+            return {rows: result, ready: true};
+        } else {
+            return {rows: [], ready: false};
+        }
     }
-    return result;
+    return {rows: [], ready: false};
 """
 
 
@@ -279,36 +300,57 @@ def commodity_to_col(name, is_sub):
     return f"-{col}" if is_sub else col
 
 
-def parse_table() -> dict:
+def try_parse_table():
+    """
+    Single attempt to read the table. Returns (commodity_dict, ready_bool).
+    Never raises for "not ready yet" — only for genuine JS execution errors,
+    which the caller treats the same as "not ready" and retries.
+    """
     try:
-        rows = driver.execute_script(PARSE_TABLE_JS)
-    except Exception as e:
-        raise RuntimeError(f"JS execution failed: {e}")
+        result = driver.execute_script(PARSE_TABLE_JS)
+    except Exception:
+        return {}, False
 
-    if not rows:
-        raise RuntimeError("Table returned no rows — district data not yet rendered")
+    if not result or not result.get("ready"):
+        return {}, False
 
     commodity_data = {}
-    for r in rows:
+    for r in result["rows"]:
         col = commodity_to_col(r["name"], r["isSub"])
         commodity_data[col] = r["val"]
 
-    return commodity_data
+    return commodity_data, True
+
+
+def wait_for_verified_table(timeout=TABLE_POLL_TIMEOUT, interval=TABLE_POLL_INTERVAL):
+    """
+    Poll until the Distributed Quantity table is present AND its Total row
+    is populated (i.e. data has actually loaded, not just the skeleton).
+    Returns the parsed commodity dict on success.
+    Raises TimeoutError if the table never becomes ready within `timeout`.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        commodities, ready = try_parse_table()
+        if ready:
+            return commodities
+        time.sleep(interval)
+
+    raise TimeoutError("Distributed Quantity table did not become ready (no populated Total row) in time")
 
 
 # ==============================
-# DISTRICT SCRAPER WITH MANDATORY ELEMENT ENFORCEMENT
+# DISTRICT SCRAPER — only ever returns after a VERIFIED successful extraction,
+# or raises after exhausting retries.
 # ==============================
-
-MAX_DISTRICT_RETRIES = 3
-
 
 def scrape_district(d, state):
     """
-    Scrape a single district. Retries up to MAX_DISTRICT_RETRIES times if the
-    district breadcrumb element ([key="district"]) is not found.
-    Raises after exhausting retries — the caller must handle (log + move on to
-    next district, NOT silently skip).
+    Scrape a single district. Retries up to MAX_DISTRICT_RETRIES times.
+    A district is only considered done (DB write happens) once
+    wait_for_verified_table() confirms real data was read.
+    Raises RuntimeError after exhausting retries — caller must catch, log,
+    and move on to the next district.
     """
     last_exc = None
 
@@ -319,11 +361,11 @@ def scrape_district(d, state):
             wait_for_js_function("stateData")
             safe_js(f"stateData('{d['code']}')")
 
-            # This is the mandatory guard — must confirm the correct district page
-            # is rendered before reading any data. TimeoutException here triggers retry.
+            # Step 1: confirm navigation landed on the right district
             wait_for_district_page(d["name"])
 
-            commodities = parse_table()
+            # Step 2: confirm the table itself has rendered with real data
+            commodities = wait_for_verified_table()
 
             row = {
                 "state": state["name"],
@@ -335,12 +377,12 @@ def scrape_district(d, state):
 
             fill_missing_sub_columns(row)
             upsert_row(row)
-            print(f"  [OK] {d['name']} — inserted")
-            return  # success
+            print(f"  [OK] {d['name']} — inserted ({len(commodities)} commodity fields)")
+            return  # verified success
 
         except Exception as e:
             last_exc = e
-            print(f"  [RETRY {attempt}/{MAX_DISTRICT_RETRIES}] {d['name']} — {type(e).__name__}")
+            print(f"  [RETRY {attempt}/{MAX_DISTRICT_RETRIES}] {d['name']} — {type(e).__name__}: {e}")
             # Navigate back to state view before retrying
             try:
                 safe_js(f"backData('{state['code']}')")
@@ -349,11 +391,117 @@ def scrape_district(d, state):
                 pass
             time.sleep(1)
 
-    # All retries exhausted — raise so caller can log and continue to next district
     raise RuntimeError(
         f"District '{d['name']}' (code: {d['code']}) failed after "
         f"{MAX_DISTRICT_RETRIES} attempts. Last error: {last_exc}"
     )
+
+
+# ==============================
+# STATE-LEVEL COLLECTION (isolated so one bad state doesn't kill the run)
+# ==============================
+
+def collect_districts_for_state(state):
+    """
+    Navigate to a state's district list and return the list of districts.
+    Retries the whole navigation sequence up to MAX_STATE_RETRIES times.
+    Raises RuntimeError if it never succeeds.
+    """
+    last_exc = None
+
+    for attempt in range(1, MAX_STATE_RETRIES + 1):
+        try:
+            open_home()
+            open_states_modal()
+
+            clicked = False
+            for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
+                if state["code"] in (l.get_attribute("onclick") or ""):
+                    l.click()
+                    clicked = True
+                    break
+
+            if not clicked:
+                raise RuntimeError(f"Could not find clickable link for state {state['name']}")
+
+            wait_for_js_function("liveDistrictdata")
+            safe_js(f"liveDistrictdata('{state['code']}')")
+            time.sleep(2)
+
+            districts = []
+            for l in driver.find_elements(By.TAG_NAME, "a"):
+                onclick = l.get_attribute("onclick")
+                if onclick and "stateData(" in onclick:
+                    match = re.search(r"stateData\('(\d+)'\)", onclick)
+                    if match:
+                        imgs = l.find_elements(By.TAG_NAME, "img")
+                        if imgs and imgs[0].get_attribute("width") == "12":
+                            districts.append({
+                                "name": imgs[0].get_attribute("aria-label"),
+                                "code": match.group(1)
+                            })
+
+            seen = set()
+            districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
+
+            if not districts:
+                raise RuntimeError("No districts found for this state — page likely not fully loaded")
+
+            return districts
+
+        except Exception as e:
+            last_exc = e
+            print(f"  [STATE RETRY {attempt}/{MAX_STATE_RETRIES}] {state['name']} — {type(e).__name__}: {e}")
+            time.sleep(2)
+
+    raise RuntimeError(
+        f"State '{state['name']}' (code: {state['code']}) failed to load districts after "
+        f"{MAX_STATE_RETRIES} attempts. Last error: {last_exc}"
+    )
+
+
+# ==============================
+# PER-STATE DISTRICT SCRAPING — mode aware ("all" vs "one")
+# ==============================
+
+def scrape_districts_for_state(districts, state, mode):
+    """
+    Drive district scraping for a single state according to `mode`:
+
+      "all" — scrape every district. A district that exhausts its retries
+              is logged and skipped; the rest of the state's districts are
+              still attempted.
+
+      "one" — scrape districts in order until ONE is successfully verified
+              and inserted, then stop. If a district exhausts its retries,
+              fall through to the next district instead of giving up on the
+              state outright. Only if every district fails does the state
+              end up with zero rows.
+
+    Always navigates back to the state view between districts, regardless
+    of mode or outcome.
+    """
+    got_one = False
+
+    for d in districts:
+        try:
+            scrape_district(d, state)
+            got_one = True
+        except RuntimeError:
+            print(f"  [FAILED] {d['name']} — exhausted {MAX_DISTRICT_RETRIES} retries")
+        finally:
+            try:
+                safe_js(f"backData('{state['code']}')")
+                wait_for_state_page()
+            except Exception:
+                pass
+
+        if mode == "one" and got_one:
+            break  # we have our one verified district for this state
+
+    if mode == "one" and not got_one:
+        print(f"  [STATE FAILED] {state['name']} — no district could be scraped "
+              f"(tried all {len(districts)} districts)")
 
 
 # ==============================
@@ -376,58 +524,23 @@ try:
                 "code": match.group(1)
             })
 
-    print(f"[INFO] {len(states)} states found — processing [{START_STATE}:{END_STATE}]")
+    print(f"[INFO] {len(states)} states found — processing [{START_STATE}:{END_STATE}] — mode={SCRAPE_MODE}")
 
     for state in states[START_STATE:END_STATE]:
 
         print(f"\n{'='*50}\n[STATE] {state['name']}")
 
-        open_home()
-        open_states_modal()
+        # Per-state isolation: a state that never loads is logged and skipped,
+        # it does NOT abort the whole batch.
+        try:
+            districts = collect_districts_for_state(state)
+        except RuntimeError as e:
+            print(f"  [STATE FAILED] {state['name']} — {e}")
+            continue
 
-        # click state
-        for l in driver.find_elements(By.CSS_SELECTOR, "#myModal11 a"):
-            if state["code"] in (l.get_attribute("onclick") or ""):
-                l.click()
-                break
-
-        wait_for_js_function("liveDistrictdata")
-        safe_js(f"liveDistrictdata('{state['code']}')")
-        time.sleep(2)
-
-        # collect districts
-        districts = []
-        for l in driver.find_elements(By.TAG_NAME, "a"):
-            onclick = l.get_attribute("onclick")
-            if onclick and "stateData(" in onclick:
-                match = re.search(r"stateData\('(\d+)'\)", onclick)
-                if match:
-                    imgs = l.find_elements(By.TAG_NAME, "img")
-                    if imgs and imgs[0].get_attribute("width") == "12":
-                        districts.append({
-                            "name": imgs[0].get_attribute("aria-label"),
-                            "code": match.group(1)
-                        })
-
-        # dedupe
-        seen = set()
-        districts = [d for d in districts if not (d["code"] in seen or seen.add(d["code"]))]
         print(f"[INFO] {len(districts)} districts found")
 
-        for d in districts:
-            try:
-                scrape_district(d, state)
-            except RuntimeError as e:
-                # District exhausted all retries — log it and continue to the next one
-                print(f"  [FAILED] {d['name']} — exhausted {MAX_DISTRICT_RETRIES} retries")
-            finally:
-                # Always navigate back to state view before next district
-                try:
-                    safe_js(f"backData('{state['code']}')")
-                    wait_for_state_page()
-                except Exception:
-                    pass
-            break
+        scrape_districts_for_state(districts, state, SCRAPE_MODE)
 
 except Exception:
     import traceback
