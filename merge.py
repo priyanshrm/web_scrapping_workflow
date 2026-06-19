@@ -6,19 +6,22 @@ import re
 
 year  = sys.argv[1]
 month = sys.argv[2]
+mode  = sys.argv[3] if len(sys.argv) > 3 else "all"  # "all" or "one"
 
-# Only pick up DB files matching the parallel job naming pattern
-# e.g. 2023_4_0_9.db or 2023_4_27_None.db — NOT old 2026_4_district_data.db files
-pattern = f"dbs/**/{year}_{month}_*.db"
+# Only pick up DB files matching the parallel job naming pattern for THIS mode
+# e.g. 2023_4_0_9_all.db or 2023_4_27_None_one.db — NOT old-format files,
+# and NOT files from the other mode (so an "all" run never silently merges
+# in leftover "one" chunks, or vice versa).
+pattern = f"dbs/**/{year}_{month}_*_{mode}.db"
 files   = glob.glob(pattern, recursive=True)
 
-print(f"Found {len(files)} DB files to merge: {files}")
+print(f"Found {len(files)} DB files to merge (mode={mode}): {files}")
 
 if not files:
     print("No matching DB files found — exiting")
     sys.exit(1)
 
-final_db = f"{year}_{month}_FINAL.db"
+final_db = f"{year}_{month}_FINAL_{mode}.db"
 
 # Remove stale final DB if it exists from a previous run
 if os.path.exists(final_db):
