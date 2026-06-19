@@ -11,6 +11,13 @@ on:
       month:
         description: 'Month'
         default: '4'
+      mode:
+        description: 'Scrape mode: all districts per state, or just one'
+        type: choice
+        options:
+          - all
+          - one
+        default: 'all'
 
 jobs:
   scrape:
@@ -58,7 +65,8 @@ jobs:
             --start ${{ matrix.start }} \
             --end ${{ matrix.end }} \
             --year ${{ github.event.inputs.year || '2023' }} \
-            --month ${{ github.event.inputs.month || '4' }}
+            --month ${{ github.event.inputs.month || '4' }} \
+            --mode ${{ github.event.inputs.mode || 'all' }}
 
       - name: Upload DB chunk
         uses: actions/upload-artifact@v4   # ✅ v4 already Node 24 compatible
@@ -88,7 +96,8 @@ jobs:
         run: |
           python merge.py \
             ${{ github.event.inputs.year || '2023' }} \
-            ${{ github.event.inputs.month || '4' }}
+            ${{ github.event.inputs.month || '4' }} \
+            ${{ github.event.inputs.mode || 'all' }}
 
       - name: Commit and push final DB
         run: |
