@@ -3,6 +3,7 @@ import time
 import os
 import sqlite3
 import json
+import calendar
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -65,6 +66,7 @@ MAX_BROWSER_RESTARTS_PER_DISTRICT = 5
 TABLE_POLL_TIMEOUT = 20       # seconds to wait for a *verified* table per attempt
 TABLE_POLL_INTERVAL = 0.4     # seconds between verification polls
 MODAL_VERIFY_TIMEOUT = 8      # seconds to confirm #myModal11 actually appeared
+MONTH_VERIFY_TIMEOUT = 8      # seconds to confirm a.done text reflects the selected month/year
 
 DISTRICTS_BEFORE_PROACTIVE_RESTART = 60  # periodic restart to dodge memory creep
 
@@ -97,11 +99,17 @@ def build_driver():
 driver, wait = build_driver()
 
 
-def restart_browser(reason="periodic"):
+def restart_browser(reason="periodic", _depth=0):
     """
-    Quit the current driver and launch a brand new one in incognito mode.
-    This is the 'nuclear option' recovery: full page/session state corruption
-    can't be fixed by re-clicking, only by starting over with a clean browser.
+    Quit the current driver and launch a brand new one in incognito mode,
+    then re-navigate home and re-select TARGET_YEAR/TARGET_MONTH, verifying
+    the selection actually stuck via the 'a.done' label.
+
+    If month verification itself fails post-relaunch (e.g. the relaunch
+    landed on another slow/broken page load), this retries the whole
+    restart up to 3 times before giving up — consistent with the rest of
+    the script's "never just give up after one shot" approach. _depth
+    guards against infinite recursion.
     """
     global driver, wait, browser_restart_count
     browser_restart_count += 1
@@ -112,7 +120,17 @@ def restart_browser(reason="periodic"):
         pass
     driver, wait = build_driver()
     open_home()
-    change_month(TARGET_YEAR, TARGET_MONTH)
+    try:
+        change_month(TARGET_YEAR, TARGET_MONTH)
+    except RuntimeError as e:
+        if _depth >= 2:
+            raise RuntimeError(
+                f"restart_browser failed to (re)select month after {_depth + 1} "
+                f"full relaunch attempts. Last error: {e}"
+            ) from e
+        print(f"  [RESTART RETRY] month verification failed post-relaunch, "
+              f"relaunching again (depth {_depth + 1}/2) — {e}")
+        restart_browser(reason=f"{reason} (retry after month-verify failure)", _depth=_depth + 1)
 
 
 # ==============================
@@ -250,7 +268,50 @@ def open_home():
     time.sleep(1.5)
 
 
-def change_month(year, month):
+def _expected_month_label(year, month):
+    """e.g. year=2023, month=8 -> 'August-2023' (matches a.done's rendered text)."""
+    return f"{calendar.month_name[month]}-{year}"
+
+
+def _read_done_label():
+    """
+    Read the current text of the 'done' link that shows the active
+    month/year, e.g.:
+      <a class="done" ...>August-2023</a>
+    Returns the stripped text, or "" if the element can't be found/read.
+    """
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, "a.done")
+        return el.text.strip()
+    except Exception:
+        return ""
+
+
+def _verify_month_selected(year, month, timeout=MONTH_VERIFY_TIMEOUT):
+    """
+    Poll a.done's text until it contains the expected 'Month-Year' label,
+    confirming the calendar selection actually took effect on the page
+    (not just that the clicks were dispatched). Raises TimeoutError if it
+    never matches in time.
+    """
+    expected = _expected_month_label(year, month)
+
+    def label_matches(d):
+        label = _read_done_label()
+        return expected.lower() in label.lower()
+
+    try:
+        WebDriverWait(driver, timeout).until(label_matches)
+    except Exception as e:
+        actual = _read_done_label()
+        raise TimeoutError(
+            f"a.done label never matched '{expected}' within {timeout}s "
+            f"(last seen: '{actual}')"
+        ) from e
+
+
+def _change_month_once(year, month):
+    """One attempt at selecting the month/year and verifying it stuck."""
     wait.until(EC.element_to_be_clickable((By.ID, "calModal"))).click()
     wait.until(EC.presence_of_element_located((By.ID, "selectedyear")))
     driver.execute_script("""
@@ -261,7 +322,36 @@ def change_month(year, month):
     time.sleep(1)
     months = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".cal_month a")))
     driver.execute_script("arguments[0].click();", months[month - 1])
-    time.sleep(2)
+    time.sleep(1)
+    _verify_month_selected(year, month)
+
+
+def change_month(year, month, max_attempts=3):
+    """
+    Open the calendar modal, select the given year/month, and VERIFY via
+    the 'a.done' label (e.g. 'August-2023') that the selection actually
+    rendered on the page before returning. Retries the click sequence
+    in-session up to max_attempts times if verification fails — a flaky
+    click or a slow-to-update label shouldn't immediately require a full
+    browser restart. Raises RuntimeError if it still hasn't stuck after
+    all in-session attempts (caller — restart_browser/main — treats that
+    as a hard failure the same as any other unrecoverable navigation step).
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _change_month_once(year, month)
+            print(f"  [MONTH OK] Confirmed '{_expected_month_label(year, month)}' selected")
+            return
+        except Exception as e:
+            last_exc = e
+            print(f"  [MONTH RETRY {attempt}/{max_attempts}] {type(e).__name__}: {e}")
+            time.sleep(1.5 * attempt)
+
+    raise RuntimeError(
+        f"Failed to select/verify month '{_expected_month_label(year, month)}' "
+        f"after {max_attempts} attempts. Last error: {last_exc}"
+    )
 
 
 def open_states_modal():
