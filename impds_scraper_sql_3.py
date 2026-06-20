@@ -275,16 +275,26 @@ def _expected_month_label(year, month):
 
 def _read_done_label():
     """
-    Read the current text of the 'done' link that shows the active
-    month/year, e.g.:
-      <a class="done" ...>August-2023</a>
+    Read the current text of the calendar 'done' link that shows the
+    active month/year, e.g.:
+      <a class="done" data-bs-target="#myModal10">August-2023</a>
+    There can be MULTIPLE elements with class "done" on this page (one of
+    them is an unrelated nav link, observed to read "DASHBOARD") so we
+    must scope the selector to the one tied to the calendar modal
+    (#myModal10) specifically, not just `a.done`.
     Returns the stripped text, or "" if the element can't be found/read.
     """
     try:
-        el = driver.find_element(By.CSS_SELECTOR, "a.done")
+        el = driver.find_element(By.CSS_SELECTOR, 'a.done[data-bs-target="#myModal10"]')
         return el.text.strip()
     except Exception:
-        return ""
+        # Fallback: some renders may use data-target instead of data-bs-target
+        # depending on the Bootstrap version loaded.
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, 'a.done[data-target="#myModal10"]')
+            return el.text.strip()
+        except Exception:
+            return ""
 
 
 def _verify_month_selected(year, month, timeout=MONTH_VERIFY_TIMEOUT):
